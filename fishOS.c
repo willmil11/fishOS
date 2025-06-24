@@ -232,8 +232,18 @@ void *realloc(void *old, uint32_t n) {
 
     // This part is now correct, assuming 'free' is also fixed.
     if (need <= cur) {
-        // A full implementation might shrink the block here.
-        // For now, just returning the old block is safe.
+        uint32_t spare = cur - need;
+        if (spare >= MIN_FREE_BLOCK) {
+            b->size_flags = need | FLAG_USED;
+            put_footer(b);
+            uint64_t v_tail = p2v(b) + HEADER_FOOTER + need;
+            blk_t *tail = (blk_t*)v2p(v_tail);
+            if (tail) {
+                tail->size_flags = spare - HEADER_FOOTER;
+                put_footer(tail);
+                list_push(tail);
+            }
+        }
         return old;
     }
     
@@ -664,105 +674,71 @@ void start(uint64_t info){
         int* bmap = svg_to_bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), svgToChr);
 
         //Post processing (fill char)
-        int W = bmap[0];
-        int H = bmap[1];
-        long pix = (long)W * H;
+        /* ------------- robust glyph interior fill (edge flood-fill) ------------ */
+int W = bmap[0];
+int H = bmap[1];
+int N = W * H;                      /* total pixel count (no metadata)    */
 
-        unsigned char *mark = (unsigned char*)malloc(pix);
-        int *queue = (int*)malloc(pix * sizeof(int));
+/* mark[i] = 0 → unvisited background
+   mark[i] = 1 → background reachable from the border (outside)          */
+unsigned char *mark = (unsigned char *)malloc(N);
+for (int i = 0; i < N; i++) {
+    mark[i] = 0;
+}
 
-        if (!mark || !queue) {
-            free(mark);
-            free(queue);
-            free(svgToChr);
-            free(bmap);
-            return NULL;
+/* simple FIFO queue for the flood-fill */
+int *queue = (int *)malloc(N * sizeof(int));
+int head = 0;
+int tail = 0;
+
+/* helper to push a pixel index into the queue if it is background */
+void push_if_bg(int idx) {
+    long o = 2 + (long)idx * 3;
+    int bg = (bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0;
+    if (bg && mark[idx] == 0) {
+        mark[idx] = 1;
+        queue[tail++] = idx;
+    }
+}
+
+/* seed the flood-fill with every transparent border pixel */
+for (int x = 0; x < W; x++) {
+    push_if_bg(x);
+    push_if_bg((H - 1) * W + x);
+}
+for (int y = 0; y < H; y++) {
+    push_if_bg(y * W);
+    push_if_bg(y * W + (W - 1));
+}
+
+/* breadth-first flood-fill of the outside region */
+while (head < tail) {
+    int p  = queue[head++];
+    int py = p / W;
+    int px = p - py * W;
+
+    if (px > 0)          push_if_bg(p - 1);
+    if (px < W - 1)      push_if_bg(p + 1);
+    if (py > 0)          push_if_bg(p - W);
+    if (py < H - 1)      push_if_bg(p + W);
+}
+
+/* every background pixel NOT reachable from the border is inside → fill */
+for (int i = 0; i < N; i++) {
+    if (mark[i] == 0) {
+        long o = 2 + (long)i * 3;
+        if ((bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0) {
+            bmap[o]     = 255;
+            bmap[o + 1] = 255;
+            bmap[o + 2] = 255;
         }
+    }
+}
 
-        for (long i = 0; i < pix; i++) {
-            mark[i] = 0;
-        }
+free(queue);
+free(mark);
+/* ---------------------------------------------------------------------- */
 
-        int head = 0;
-        int tail = 0;
-
-        for (int x = 0; x < W; x++) {
-            int top = 2 + x * 3;
-            int bot = 2 + ((H - 1) * W + x) * 3;
-
-            if (!(bmap[top] || bmap[top + 1] || bmap[top + 2])) {
-                mark[x] = 1;
-                queue[tail++] = x;
-            }
-
-            if (!(bmap[bot] || bmap[bot + 1] || bmap[bot + 2])) {
-                mark[x + (H - 1) * W] = 1;
-                queue[tail++] = x + (H - 1) * W;
-            }
-        }
-
-        for (int y = 1; y < H - 1; y++) {
-            int lef = 2 + (y * W) * 3;
-            int rig = 2 + (y * W + (W - 1)) * 3;
-
-            if (!(bmap[lef] || bmap[lef + 1] || bmap[lef + 2])) {
-                mark[y * W] = 1;
-                queue[tail++] = y * W;
-            }
-
-            if (!(bmap[rig] || bmap[rig + 1] || bmap[rig + 2])) {
-                mark[y * W + (W - 1)] = 1;
-                queue[tail++] = y * W + (W - 1);
-            }
-        }
-
-        while (head < tail) {
-            int idx = queue[head++];
-            int x = idx % W;
-            int y = idx / W;
-
-            int nb[4][2] = { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
-
-            for (int n = 0; n < 4; n++) {
-                int nx = x + nb[n][0];
-                int ny = y + nb[n][1];
-
-                if (nx < 0 || nx >= W || ny < 0 || ny >= H) {
-                    continue;
-                }
-
-                int nidx = ny * W + nx;
-                int pix = 2 + nidx * 3;
-
-                if (mark[nidx]) {
-                    continue;
-                }
-
-                if (bmap[pix] || bmap[pix + 1] || bmap[pix + 2]) {
-                    continue;
-                }
-
-                mark[nidx] = 1;
-                queue[tail++] = nidx;
-            }
-        }
-
-        for (long p = 0; p < pix; p++) {
-            if (mark[p]) {
-                continue;
-            }
-
-            int i = 2 + p * 3;
-
-            if (bmap[i] || bmap[i + 1] || bmap[i + 2]) {
-                continue;
-            }
-
-            bmap[i] = bmap[i + 1] = bmap[i + 2] = 255;
-        }
-
-        free(mark);
-        free(queue);
 
         free(svgToChr);
 
@@ -848,7 +824,7 @@ void start(uint64_t info){
     bool flipper = false;
     while (true){
         int* tmp;
-        tmp = draw_chr('b', xpos, 100, 1, screen);
+        tmp = draw_chr('t', xpos, 100, 1, screen);
         if (!tmp){
             if (xpos >= screen_w){
                 flipper = true;
@@ -866,7 +842,7 @@ void start(uint64_t info){
             }
             continue;
         }
-        tmp = draw_chr('r', xpos + 24, 100, 1, screen);
+        tmp = draw_chr('e', xpos + 24, 100, 1, screen);
         if (!tmp){
             if (xpos >= screen_w){
                 flipper = true;
@@ -884,7 +860,7 @@ void start(uint64_t info){
             }
             continue;
         }
-        tmp = draw_chr('u', xpos + 24 * 2, 100, 1, screen);
+        tmp = draw_chr('s', xpos + 24 * 2, 100, 1, screen);
         if (!tmp){
             if (xpos >= screen_w){
                 flipper = true;
@@ -902,7 +878,7 @@ void start(uint64_t info){
             }
             continue;
         }
-        tmp = draw_chr('h', xpos + 24 * 3, 100, 1, screen);
+        tmp = draw_chr('t', xpos + 24 * 3, 100, 1, screen);
         if (!tmp){
             if (xpos >= screen_w){
                 flipper = true;

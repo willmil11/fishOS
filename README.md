@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.2
+# 🐟 FishOS 0.0.3
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -11,6 +11,7 @@ The iso works on x86, you can run ```qemu-system-x86_64 -cdrom fishos.iso -m 102
 
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.3 — Better text fill even tough still flawed.
 - 0.0.2 — Readme edit.
 - 0.0.1 — memory allocator + frame render + text raster + bouncing text
 - junk — old stuff
