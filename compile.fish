@@ -1,24 +1,45 @@
 #!/usr/bin/env fish
-echo "[*] build…"
+echo "[*] Building FishOS..."
 
-nasm -f bin boot.asm   -o boot.bin
-nasm -f bin stage2.asm -o stage2.bin
+# Clean
+rm -rf iso '*.o' '*.elf' '*.iso'
 
-gcc -ffreestanding -m64 -mno-red-zone -c fishOS.c -o fishOS.o
-ld  -nostdlib -T linker.ld fishOS.o -o kernel.elf
-objcopy -O binary kernel.elf kernel.bin
+# Assemble Multiboot2 header
+nasm -f elf64 boot.asm -o boot.o
+or begin
+    echo "[-] Failed to assemble boot.asm"
+    exit 1
+end
 
-set s2_size  (stat -c "%s" stage2.bin)
-set s2_secs  (math "ceil( $s2_size / 512 )")
-set k_size   (stat -c "%s" kernel.bin)
-set k_secs   (math "ceil( $k_size / 512 )")
-set k_dwords (math "ceil( $k_size / 4 )")
+# Compile C kernel
+gcc -ffreestanding -m64 -mno-red-zone -O0 -g -fno-omit-frame-pointer -fno-inline -fno-stack-protector -c fishOS.c -o fishOS.o
+or begin
+    echo "[-] Failed to compile fishOS.c"
+    exit 1
+end
 
-dd if=(printf "%08x" $k_dwords | sed -E 's/(..)(..)(..)(..)/\\x\4\\x\3\\x\2\\x\1/') bs=1 seek=504 of=boot.bin conv=notrunc &>/dev/null
-printf "%c" $s2_secs | dd bs=1 seek=508 of=boot.bin conv=notrunc &>/dev/null
-printf "%c" $k_secs  | dd bs=1 seek=509 of=boot.bin conv=notrunc &>/dev/null
-echo "[patch] boot.bin: s2_secs=$s2_secs, k_secs=$k_secs, k_dwords=$k_dwords"
+# Link using GCC (no PIE, no relocations)
+gcc -ffreestanding -nostdlib -static -no-pie -m64 -g -T linker.ld -o kernel.elf boot.o fishOS.o
+or begin
+    echo "[-] Failed to link kernel.elf"
+    exit 1
+end
 
-cat boot.bin stage2.bin kernel.bin > os.img
-echo "run QEMU…"
-qemu-system-x86_64 -vga std -drive format=raw,file=os.img
+# Create ISO
+mkdir -p iso/boot/grub
+cp kernel.elf iso/boot/
+cp boot/grub/grub.cfg iso/boot/grub/
+
+grub-mkrescue -o fishos.iso iso/
+or begin
+    echo "[-] Failed to make ISO"
+    exit 1
+end
+
+echo "[*] Build complete. Running..."
+#We give 1gb ram with -m 1024 but you can change it.
+qemu-system-x86_64 -cdrom fishos.iso -m 1024 -accel kvm
+
+rm boot.o fishOS.o kernel.elf
+rm -rf iso
+echo "[*] Cleaned up build artifacts."

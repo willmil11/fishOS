@@ -1,127 +1,166 @@
-bits 16
-org 0x7C00
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  Multiboot 2 header (8-byte aligned)                             ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-%define VBE_INFO_BLOCK 0x1000
-%define VBE_MODE_INFO  0x1100
-%define BOOT_DATA_FB_ADDR   0x1F00
-%define BOOT_DATA_WIDTH     0x1F04
-%define BOOT_DATA_HEIGHT    0x1F08
-%define BOOT_DATA_PITCH     0x1F0C
-%define BOOT_DATA_KSIZE     0x1F10
-%define KERNEL_TEMP_ADDR 0x1000
+section .multiboot2
+align 8
+mb2_header_start:
+    dd 0xE85250D6
+    dd 0
+    dd mb2_header_end - mb2_header_start
+    dd -(0xE85250D6 + 0 + (mb2_header_end - mb2_header_start))
 
-start:
-    cli
-    xor ax, ax
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov sp, 0x7C00
+    ; frame-buffer request -------------------------------------------
+    dw 5, 0
+    dd 24
+    dd 0, 0, 0, 0
 
-; --- VBE Setup ---
-    mov ax, 0x4F00
-    mov di, VBE_INFO_BLOCK
-    int 0x10
-    cmp ax, 0x004F
-    jne hang
+    ; memory-map request --------------------------------------------
+    dw 4, 0
+    dd 8
 
-    mov bx, [VBE_INFO_BLOCK+0x0E]
-    mov es, [VBE_INFO_BLOCK+0x10]
-    mov ax, es
-    mov ds, ax
-    mov si, bx
-find_mode:
-    lodsw
-    cmp ax, 0xFFFF
-    je hang
-    push ax
-    mov cx, ax
-    mov di, VBE_MODE_INFO
-    mov ax, 0x4F01
-    int 0x10
-    pop bx
-    cmp ax, 0x004F
-    jne find_mode
-    test word [VBE_MODE_INFO], 0x90 
-    jz find_mode
-    cmp byte [VBE_MODE_INFO+0x19], 32
-    jne find_mode
-    jmp found_mode
-    jmp find_mode
+    ; end tag --------------------------------------------------------
+    dw 0, 0
+    dd 8
+mb2_header_end:
 
-found_mode:
-    ; Set the video mode using the mode number in BX
-    mov ax, 0x4F02
-    or bx, 0x4000
-    int 0x10
-    cmp ax, 0x004F
-    jne hang
 
-    ; THE DEFINITIVE FIX:
-    ; The last int 0x10 call corrupted DS. We MUST restore it to 0
-    ; BEFORE we try to read or write to our data areas.
-    xor ax, ax
-    mov ds, ax
-    
-; --- Store Info in Hardcoded Locations ---
-    mov eax, [VBE_MODE_INFO+0x28]
-    mov dword [BOOT_DATA_FB_ADDR], eax
-    xor eax, eax
-    mov ax, [VBE_MODE_INFO+0x12]
-    mov dword [BOOT_DATA_WIDTH], eax
-    xor eax, eax
-    mov ax, [VBE_MODE_INFO+0x14]
-    mov dword [BOOT_DATA_HEIGHT], eax
-    xor eax, eax
-    mov ax, [VBE_MODE_INFO+0x16]
-    mov dword [BOOT_DATA_PITCH], eax
-    mov eax, [k_dword_count]
-    mov dword [BOOT_DATA_KSIZE], eax
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  Bootstrap – switch to long mode and jump to C kernel            ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; --- Disk Loading (with robust error checking) ---
-    mov ah, 0x02
-    mov al, [s2_sectors_count]
-    mov ch, 0
-    mov cl, 2
-    mov dh, 0
-    mov dl, 0x80
-    mov ax, 0x0800
-    mov es, ax
-    mov bx, 0x0000
-    int 0x13
-    jc hang
-    cmp ah, 0
-    jne hang
+section .bootstrap
+bits 32
+global _start
+extern start
 
-    mov ah, 0x02
-    mov al, [k_sectors_count]
-    mov ch, 0
-    mov cl, [s2_sectors_count]
-    add cl, 2
-    mov dh, 0
-    mov dl, 0x80
-    mov ax, KERNEL_TEMP_ADDR
-    mov es, ax
-    mov bx, 0x0000
-    int 0x13
-    jc hang
-    cmp ah, 0
-    jne hang
+_start:
+    ; 1. zero PML4 + PDPT -------------------------------------------
+    mov     edi, pml4_table
+    mov     ecx, 4096*2
+    xor     eax, eax
+    cld
+    rep     stosb
 
-; --- Reset segment registers and jump ---
-    cli
-    xor ax, ax
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    jmp 0x0000:0x8000
+    ; 2. link PML4 → PDPT -------------------------------------------
+    mov     eax, pdpt_table
+    or      eax, 0b11
+    mov     [pml4_table], eax
 
-hang:
+    ; 3. identity-map first 256 GiB with 1 GiB pages -----------------
+    xor     ecx, ecx
+.map_loop:
+    mov     eax, ecx
+    shl     eax, 30                ; 1 GiB * ECX
+    xor     edx, edx
+    or      eax, 0b10000011        ; present|writable|1 GiB
+    lea     edi, [pdpt_table + ecx*8]
+    mov     [edi],  eax
+    mov     [edi+4], edx
+    inc     ecx
+    cmp     ecx, 256
+    jl      .map_loop
+
+    ; 4. enable paging + long mode ----------------------------------
+    mov     eax, pml4_table
+    mov     cr3, eax
+
+    mov     eax, cr4
+    or      eax, 1<<5              ; CR4.PAE
+    mov     cr4, eax
+
+    mov     ecx, 0xC0000080        ; IA32_EFER
+    rdmsr
+    or      eax, 1<<8              ; EFER.LME
+    wrmsr
+
+    mov     eax, cr0
+    or      eax, 1<<31             ; CR0.PG
+    mov     cr0, eax
+
+    ; 5. load GDT and far-jump to 64-bit code ------------------------
+    lgdt    [gdt_descriptor]
+    jmp     0x08:long_mode_start
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  64-bit GDT                                                      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+section .gdt
+gdt_start:
+    dq 0
+    dq 0x00209A0000000000          ; 0x08 – code
+    dq 0x0000920000000000          ; 0x10 – data
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dq gdt_start
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  Long-mode entry point                                           ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+section .text
+bits 64
+long_mode_start:
+    ; --- minimal/dummy IDT -----------------------------------------
+    lidt    [idt_descriptor]       ; make sure faults have someplace to go
+
+    ; --- enable FPU/SSE (use 64-bit regs here) ----------------------
+    mov     rax, cr0
+    and     rax, ~(1 << 2)         ; clear EM
+    or      rax,  1 << 1           ; set  MP
+    mov     cr0, rax
+
+    mov     rax, cr4
+    or      rax, (1 << 9) | (1 << 10)  ; OSFXSR | OSXMMEXCPT
+    mov     cr4, rax
+
+    finit                           ; zero x87/SSE state
+    ; ----------------------------------------------------------------
+
+    mov     ax, 0x10
+    mov     ds, ax
+    mov     es, ax
+    mov     fs, ax
+    mov     gs, ax
+    mov     ss, ax
+
+    mov     rsp, stack_top          ; establish stack
+
+    mov     rdi, rbx                ; pass Multiboot 2 info ptr
+    call    start                   ; into C kernel
+
+.hang:
     hlt
-    jmp hang
+    jmp     .hang
 
-times 504 - ($ - $$) db 0
-k_dword_count:    dd 0
-s2_sectors_count: db 0
-k_sectors_count:  db 0
-dw 0xAA55
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  Dummy 256-entry IDT (all zero)                                  ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+section .rodata
+align 16
+idt:
+    times 256 dq 0
+idt_end:
+
+idt_descriptor:
+    dw idt_end - idt - 1
+    dq idt
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;  BSS                                                             ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+section .bss
+align 4096
+pml4_table:   resb 4096
+pdpt_table:   resb 4096
+stack_bottom: resb 4096*4
+stack_top:
