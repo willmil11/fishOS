@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.1
+# 🐟 FishOS 0.0.2
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -6,7 +6,14 @@ It's an os built from scratch, the only thing not built by me here is grub that 
 # Why?
 Why not?
 
+# How to use
+The iso works on x86, you can run ```qemu-system-x86_64 -cdrom fishos.iso -m 1024 -accel kvm``` to run it if you have qemu installed. Remove ```-accel kvm``` if you don't have virtualisation enabled. You can change the amount of ram you give it by changing ```1024``` to something else in mb. If you want to change the code and test it you can use ```fish compile.fish``` assuming you have all the tools required by the fish script including fish itself to run it.
+
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.2 — Readme edit.
 - 0.0.1 — memory allocator + frame render + text raster + bouncing text
 - junk — old stuff
+
+# Liscense
+Mit liscense: <a href="./LICENSE">LICENSE</a>
