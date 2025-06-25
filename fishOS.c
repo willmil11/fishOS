@@ -2,6 +2,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+void *malloc (uint32_t n);
+void  free   (void *ptr);
+void *realloc(void *ptr, uint32_t n);
+
 uint64_t __stack_chk_guard = 0xdeadbeefcafebabe;
 void __attribute__((noreturn)) __stack_chk_fail(void) { for(;;)__asm__("cli;hlt"); }
 
@@ -52,6 +56,39 @@ __attribute__((noreturn)) void PANIC(void)
 }
 #define ASSERT(c) do { if(!(c)) PANIC(); } while(0)
 
+static inline void verify(blk_t *b) {
+    uint32_t sz = b->size_flags & SIZE_MASK;
+
+    /* size and alignment checks */
+    ASSERT(sz >= MIN_PAYLOAD_FREE && ((uintptr_t)b & 7u) == 0);
+
+    /* header ↔ footer consistency */
+    uint32_t *foot = (uint32_t *)((uint8_t *)b + 4 + sz);
+    ASSERT(*foot == sz);
+
+    /* used blocks must not be on any free list */
+    if (b->size_flags & FLAG_USED)
+        ASSERT(b->next == NULL && b->prev == NULL);
+}
+
+static inline bool is_valid_block(blk_t *b) {
+        if (!b) return false;
+        uint32_t sz = b->size_flags & SIZE_MASK;
+        if (sz < MIN_PAYLOAD_FREE)              return false;
+        if (((uintptr_t)b & 7u) != 0)           return false;
+        uint32_t *foot = (uint32_t *)((uint8_t*)b + 4 + sz);
+        return *foot == sz;
+}
+
+static void heap_selftest(void) {
+        void *a = malloc(24);
+        void *b = malloc(24);
+        free(a);
+        void *c = malloc(24);
+        ASSERT(c == a);          /* recycled the block we just freed  */
+        free(b);  free(c);
+}
+
 static inline void* v2p(uint64_t v){
     for(int i=0;i<n_region;++i)
         if(v>=region[i].v && v<region[i].v+region[i].sz)
@@ -85,11 +122,13 @@ static inline blk_t** pick_bin(uint32_t sz, blk_t ***rover){
     *rover=&rov_big;  return &bin_big;
 }
 static inline void list_push(blk_t *b){
+    //verify(b);
     blk_t **rov,**head=pick_bin(b->size_flags&SIZE_MASK,&rov);
     b->prev=0; b->next=*head; if(*head) (*head)->prev=b; *head=b;
     if(!*rov) *rov=b;
 }
 static inline void list_remove(blk_t *b){
+    //verify(b);
     blk_t **rov,**head=pick_bin(b->size_flags&SIZE_MASK,&rov);
     if(b->prev) b->prev->next=b->next; else *head=b->next;
     if(b->next) b->next->prev=b->prev;
@@ -151,6 +190,7 @@ void *malloc(uint32_t n){
                 uint32_t csz = cur->size_flags & SIZE_MASK;
                 if (csz >= sz && csz < best_sz) {
                     best = cur; best_sz = csz;
+                    //verify(best);
                     if (csz == sz) break;
                 }
             }
@@ -166,6 +206,8 @@ void *malloc(uint32_t n){
     if(!best) return 0;
 
     list_remove(best);
+    *rov = (*bin);
+    best->next = best->prev = 0;
     uint32_t spare=best_sz - sz;
 
     if(spare >= MIN_FREE_BLOCK){
@@ -173,7 +215,11 @@ void *malloc(uint32_t n){
         tail->size_flags = spare - HEADER_FOOTER;
         put_footer(tail); list_push(tail);
         best->size_flags = sz|FLAG_USED; put_footer(best);
-    }else  best->size_flags |= FLAG_USED;
+    } else {
+       best->size_flags |= FLAG_USED;
+       put_footer(best);          /* footer must match the header     */
+    }
+
 
     return (uint8_t*)best + 4;
 }
@@ -191,6 +237,8 @@ void free(void *ptr) {
     }
 
     blk_t *b = (blk_t*)((uint8_t*)ptr - 4);
+    //ASSERT(b->size_flags & FLAG_USED);
+    //verify(b);
     b->size_flags &= SIZE_MASK;
     put_footer(b);
 
@@ -198,8 +246,8 @@ void free(void *ptr) {
 
     // Right-coalesce
     uint64_t v_r = v_b + HEADER_FOOTER + (b->size_flags & SIZE_MASK);
-    blk_t *r = (blk_t*)v2p(v_r);
-    if (r && !(r->size_flags & FLAG_USED)) {
+    blk_t   *r   = (blk_t*)v2p(v_r);
+    if (is_valid_block(r) && !(r->size_flags & FLAG_USED)) {
         list_remove(r);
         b->size_flags += HEADER_FOOTER + (r->size_flags & SIZE_MASK);
         put_footer(b);
@@ -210,7 +258,7 @@ void free(void *ptr) {
         uint32_t psz = *(((uint32_t*)b) - 1) & SIZE_MASK;
         uint64_t v_l = v_b - HEADER_FOOTER - psz;
         blk_t *l = (blk_t*)v2p(v_l);
-        if (l && !(l->size_flags & FLAG_USED)) {
+        if (is_valid_block(l) && !(l->size_flags & FLAG_USED)) {
             list_remove(l);
             l->size_flags += HEADER_FOOTER + (b->size_flags & SIZE_MASK);
             put_footer(l);
@@ -226,6 +274,7 @@ void *realloc(void *old, uint32_t n) {
     if (!n) { free(old); return 0; }
 
     blk_t *b = (blk_t*)((uint8_t*)old - 4);
+    //verify(b);
     uint32_t cur = b->size_flags & SIZE_MASK;
     uint32_t need = ALIGN8(n);
     if (need < MIN_PAYLOAD_FREE) need = MIN_PAYLOAD_FREE;
@@ -244,6 +293,7 @@ void *realloc(void *old, uint32_t n) {
                 list_push(tail);
             }
         }
+        //verify(b);
         return old;
     }
     
@@ -269,6 +319,7 @@ void *realloc(void *old, uint32_t n) {
                 b->size_flags = comb | FLAG_USED;
                 put_footer(b);
             }
+            //verify(b);
             return old;
         }
     }
@@ -350,7 +401,7 @@ void start(uint64_t info){
                 }
         }
     heap_init();
-
+    heap_selftest();
     //Actual code starts here
     //
 
@@ -675,70 +726,69 @@ void start(uint64_t info){
 
         //Post processing (fill char)
         /* ------------- robust glyph interior fill (edge flood-fill) ------------ */
-int W = bmap[0];
-int H = bmap[1];
-int N = W * H;                      /* total pixel count (no metadata)    */
+        int W = bmap[0];
+        int H = bmap[1];
+        int N = W * H;                      /* total pixel count (no metadata)    */
 
-/* mark[i] = 0 → unvisited background
-   mark[i] = 1 → background reachable from the border (outside)          */
-unsigned char *mark = (unsigned char *)malloc(N);
-for (int i = 0; i < N; i++) {
-    mark[i] = 0;
-}
-
-/* simple FIFO queue for the flood-fill */
-int *queue = (int *)malloc(N * sizeof(int));
-int head = 0;
-int tail = 0;
-
-/* helper to push a pixel index into the queue if it is background */
-void push_if_bg(int idx) {
-    long o = 2 + (long)idx * 3;
-    int bg = (bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0;
-    if (bg && mark[idx] == 0) {
-        mark[idx] = 1;
-        queue[tail++] = idx;
-    }
-}
-
-/* seed the flood-fill with every transparent border pixel */
-for (int x = 0; x < W; x++) {
-    push_if_bg(x);
-    push_if_bg((H - 1) * W + x);
-}
-for (int y = 0; y < H; y++) {
-    push_if_bg(y * W);
-    push_if_bg(y * W + (W - 1));
-}
-
-/* breadth-first flood-fill of the outside region */
-while (head < tail) {
-    int p  = queue[head++];
-    int py = p / W;
-    int px = p - py * W;
-
-    if (px > 0)          push_if_bg(p - 1);
-    if (px < W - 1)      push_if_bg(p + 1);
-    if (py > 0)          push_if_bg(p - W);
-    if (py < H - 1)      push_if_bg(p + W);
-}
-
-/* every background pixel NOT reachable from the border is inside → fill */
-for (int i = 0; i < N; i++) {
-    if (mark[i] == 0) {
-        long o = 2 + (long)i * 3;
-        if ((bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0) {
-            bmap[o]     = 255;
-            bmap[o + 1] = 255;
-            bmap[o + 2] = 255;
+        /* mark[i] = 0 → unvisited background
+        mark[i] = 1 → background reachable from the border (outside)          */
+        unsigned char *mark = (unsigned char *)malloc(N);
+        for (int i = 0; i < N; i++) {
+            mark[i] = 0;
         }
-    }
-}
 
-free(queue);
-free(mark);
-/* ---------------------------------------------------------------------- */
+        /* simple FIFO queue for the flood-fill */
+        int *queue = (int *)malloc(N * sizeof(int));
+        int head = 0;
+        int tail = 0;
 
+        /* helper to push a pixel index into the queue if it is background */
+        void push_if_bg(int idx) {
+            long o = 2 + (long)idx * 3;
+            int bg = (bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0;
+            if (bg && mark[idx] == 0) {
+                mark[idx] = 1;
+                queue[tail++] = idx;
+            }
+        }
+
+        /* seed the flood-fill with every transparent border pixel */
+        for (int x = 0; x < W; x++) {
+            push_if_bg(x);
+            push_if_bg((H - 1) * W + x);
+        }
+        for (int y = 0; y < H; y++) {
+            push_if_bg(y * W);
+            push_if_bg(y * W + (W - 1));
+        }
+
+        /* breadth-first flood-fill of the outside region */
+        while (head < tail) {
+            int p  = queue[head++];
+            int py = p / W;
+            int px = p - py * W;
+
+            if (px > 0)          push_if_bg(p - 1);
+            if (px < W - 1)      push_if_bg(p + 1);
+            if (py > 0)          push_if_bg(p - W);
+            if (py < H - 1)      push_if_bg(p + W);
+        }
+
+        /* every background pixel NOT reachable from the border is inside → fill */
+        for (int i = 0; i < N; i++) {
+            if (mark[i] == 0) {
+                long o = 2 + (long)i * 3;
+                if ((bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0) {
+                    bmap[o]     = 255;
+                    bmap[o + 1] = 255;
+                    bmap[o + 2] = 255;
+                }
+            }
+        }
+
+        free(queue);
+        free(mark);
+        /* ---------------------------------------------------------------------- */
 
         free(svgToChr);
 
@@ -815,102 +865,65 @@ free(mark);
     screen[0] = screen_w;
     screen[1] = screen_h;
 
-    for (int index = 2; index < (screen[0] * screen[1]); index++){
+    for (int index = 2; index < (screen[0] * screen[1] * 3); index++){
         screen[index] = 0;
     }
     
     //Cool test
-    int xpos = 0;
-    bool flipper = false;
-    while (true){
-        int* tmp;
-        tmp = draw_chr('t', xpos, 100, 1, screen);
-        if (!tmp){
-            if (xpos >= screen_w){
-                flipper = true;
-            }
-            else{
-                if (xpos <= 0){
-                    flipper = false;
+    char* scrollback = malloc(1);
+    scrollback[0] = '\0';
+    int scrollback_cursor = 0;
+    int scrollback_size = 0;
+
+    void refresh_scrollback_render(){
+        int column = 0;
+        int row = 0;
+        int skiprow = 0;
+        int howmanycharsinarow = 0;
+        for (int index = 0; !(scrollback[index] == '\0'); index++){
+            int x_char = (int)(screen_w / 50 + (column * 16));
+            int y_char = (int)(24 * row);
+
+            if (x_char + 16 > screen_w){
+                column = 0;
+                row++;
+                if (!howmanycharsinarow){
+                    howmanycharsinarow = index;
+                }
+                if ((int)(24 * row) > screen_h){
+                    skiprow++;
                 }
             }
-            if (flipper){
-                xpos -= 3;
+
+            if (row >= skiprow){
+                draw_chr(scrollback[index], 16 * column, 24 * (row - skiprow), 1, screen);
             }
-            else{
-                xpos += 3;
-            }
-            continue;
+
+            column++;
         }
-        tmp = draw_chr('e', xpos + 24, 100, 1, screen);
-        if (!tmp){
-            if (xpos >= screen_w){
-                flipper = true;
-            }
-            else{
-                if (xpos <= 0){
-                    flipper = false;
-                }
-            }
-            if (flipper){
-                xpos -= 3;
-            }
-            else{
-                xpos += 3;
-            }
-            continue;
+    }
+
+    void print(char* text){
+        int text_len;
+        for (text_len = 0; !(text[text_len] == '\0'); text_len++){}
+
+        scrollback = realloc(scrollback, scrollback_size + text_len + 1);
+        for (int index = 0; index < text_len; index++){
+            scrollback[scrollback_size + index] = text[index];
         }
-        tmp = draw_chr('s', xpos + 24 * 2, 100, 1, screen);
-        if (!tmp){
-            if (xpos >= screen_w){
-                flipper = true;
-            }
-            else{
-                if (xpos <= 0){
-                    flipper = false;
-                }
-            }
-            if (flipper){
-                xpos -= 3;
-            }
-            else{
-                xpos += 3;
-            }
-            continue;
-        }
-        tmp = draw_chr('t', xpos + 24 * 3, 100, 1, screen);
-        if (!tmp){
-            if (xpos >= screen_w){
-                flipper = true;
-            }
-            else{
-                if (xpos <= 0){
-                    flipper = false;
-                }
-            }
-            if (flipper){
-                xpos -= 3;
-            }
-            else{
-                xpos += 3;
-            }
-            continue;
-        }
-        screen = tmp;
-        if (xpos >= screen_w){
-            flipper = true;
-        }
-        else{
-            if (xpos <= 0){
-                flipper = false;
-            }
-        }
-        if (flipper){
-            xpos -= 3;
-        }
-        else{
-            xpos += 3;
-        }
+        scrollback[scrollback_size + text_len] = '\0';
+
+        scrollback_size += text_len;
+
+        refresh_scrollback_render();
         render_frame(screen);
     }
+
+    while (true){
+        for (int index = 0; index < font_chars_length; index++){
+            print(font_chars[index][0]);
+        }
+    }
+
+    for (;;) __asm__("cli; hlt"); 
 }
