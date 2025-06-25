@@ -405,157 +405,202 @@ void start(uint64_t info){
     //Actual code starts here
     //
 
-    //Font renderer
-    int* svg_to_bitmap(int width, int height, const char* svg) {
+    int* svg_to_bitmap(int width, int height, const char* svg){
         long total = 2 + width * height * 3 + 1;
         int* buf = (int*)malloc(total * sizeof(int));
         buf[0] = width; buf[1] = height;
-        for (long i = 2; i < total; i++) buf[i] = 0;
+        for (long i = 2; i < total; ++i) buf[i] = 0;
         buf[total - 1] = 0;
 
-        float minx = 0, miny = 0, maxx = 0, maxy = 0;
-        int first = 1, i = 0;
+        #define IABS(a) ((a)<0 ? -(a) : (a))
+        #define FABS(a) ((a)<0.f? -(a) : (a))
 
-        // Find bounding box
-        while (svg[i]) {
-            char c = svg[i];
-            if (c != 'M' && c != 'L' && c != 'Q') { i++; continue; }
-            i++;
-            int need = (c == 'Q' ? 4 : 2);
-            for (int n = 0; n < need; n++) {
-                while (svg[i] == ' ' || svg[i] == ',' || svg[i] == '\n' || svg[i] == '\r' || svg[i] == '\t') i++;
-                int sgn = 1; if (svg[i] == '-') { sgn = -1; i++; }
-                float val = 0, frac = 0, scale = 0.1f;
-                while ((svg[i] >= '0' && svg[i] <= '9') || svg[i] == '.') {
-                    if (svg[i] == '.') { i++; while (svg[i] >= '0' && svg[i] <= '9') { frac += (svg[i++] - '0') * scale; scale *= 0.1f; } break; }
-                    val = val * 10 + (svg[i++] - '0');
+        /* ---- 1. bounding box ------------------------------------------------- */
+        float minx=0,miny=0,maxx=0,maxy=0; int first=1,p=0;
+        while(svg[p]){
+            char c=svg[p];
+            if(c!='M'&&c!='L'&&c!='Q'){++p;continue;}
+            ++p; int need=(c=='Q')?4:2;
+            for(int n=0;n<need;++n){
+                while(svg[p]==' '||svg[p]==','||svg[p]=='\n'||svg[p]=='\r'||svg[p]=='\t')++p;
+                int sgn=1; if(svg[p]=='-'){sgn=-1;++p;}
+                float v=0,fr=0,s=0.1f;
+                while((svg[p]>='0'&&svg[p]<='9')||svg[p]=='.'){
+                    if(svg[p]=='.'){++p;
+                        while(svg[p]>='0'&&svg[p]<='9'){fr+=(svg[p++]-'0')*s; s*=0.1f;}
+                        break;}
+                    v=v*10+(svg[p++]-'0');
                 }
-                float full = sgn * (val + frac);
-                if (first) { minx = maxx = full; miny = maxy = full; first = 0; }
-                if (n & 1) { if (full < miny) miny = full; if (full > maxy) maxy = full; }
-                else       { if (full < minx) minx = full; if (full > maxx) maxx = full; }
+                float full=sgn*(v+fr);
+                if(first){minx=maxx=full;miny=maxy=full;first=0;}
+                if(n&1){if(full<miny)miny=full; if(full>maxy)maxy=full;}
+                else   {if(full<minx)minx=full; if(full>maxx)maxx=full;}
             }
         }
+        float dx=maxx-minx; if(dx==0)dx=1;
+        float dy=maxy-miny; if(dy==0)dy=1;
+        float sx=(width-1)/dx, sy=(height-1)/dy;
+        float scale=(sx<sy)?sx:sy;
+        float offx=((width-1)-scale*dx)/2.f;
+        float offy=((height-1)-scale*dy)/2.f;
 
-        float diffx = maxx - minx; if (diffx == 0) diffx = 1;
-        float diffy = maxy - miny; if (diffy == 0) diffy = 1;
-        float scalex = (float)(width  - 1) / diffx;
-        float scaley = (float)(height - 1) / diffy;
-        float scale = (scalex < scaley) ? scalex : scaley;
-        float offx = ((width  - 1) - scale * diffx) / 2.0f;
-        float offy = ((height - 1) - scale * diffy) / 2.0f;
+        /* ---- 2. edge store (float) ------------------------------------------ */
+        int cap=256, cnt=0;
+        float* segs=(float*)malloc(cap*4*sizeof(float));
+        #define PUSH(x0,y0,x1,y1) do{                               \
+            if(cnt>=cap){                                           \
+                int ncap=cap*2;                                     \
+                float* ns=(float*)malloc(ncap*4*sizeof(float));     \
+                for(int _i=0;_i<cap*4;++_i) ns[_i]=segs[_i];        \
+                free(segs); segs=ns; cap=ncap; }                    \
+            segs[4*cnt+0]=(x0); segs[4*cnt+1]=(y0);                 \
+            segs[4*cnt+2]=(x1); segs[4*cnt+3]=(y1); ++cnt;          \
+        }while(0)
 
-        // replacements for abs() and fabsf()
-        #define iabs(a) ((a) < 0 ? -(a) : (a))
-        #define fabsf(a) ((a) < 0.0f ? -(a) : (a))
+        /* ---- 3. path scan: stroke (int) + collect edges (float) ------------- */
+        int i=0, cx=0, cy=0, sx0=0, sy0=0;
+        float fx=0.f, fy=0.f, sfx=0.f, sfy=0.f;
 
-        i = 0;
-        int cx = 0, cy = 0, sx0 = 0, sy0 = 0;
-        while (svg[i]) {
-            char cmd = svg[i];
-            if (cmd != 'M' && cmd != 'L' && cmd != 'Q' && cmd != 'Z') { i++; continue; }
-            i++;
+        while(svg[i]){
+            char cmd=svg[i];
+            if(cmd!='M'&&cmd!='L'&&cmd!='Q'&&cmd!='Z'){++i;continue;}
+            ++i;
 
-            if (cmd == 'Z') {
-                int x1 = sx0, y1 = sy0;
-                int x0 = cx,  y0 = cy;
-                int dx = iabs(x1 - x0), sx = (x0 < x1 ? 1 : -1);
-                int dy = iabs(y1 - y0), sy = (y0 < y1 ? 1 : -1);
-                int err = (dx > dy ? dx : -dy) / 2;
-                for (;;) {
-                    if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
-                        long p = 2 + ((long)y0 * width + x0) * 3;
-                        buf[p] = buf[p + 1] = buf[p + 2] = 255;
+            if(cmd=='Z'){
+                /* stroke */
+                int x1=sx0,y1=sy0,x0=cx,y0=cy;
+                int dx=IABS(x1-x0), sx=(x0<x1?1:-1);
+                int dy=IABS(y1-y0), sy=(y0<y1?1:-1);
+                int err=(dx>dy?dx:-dy)/2;
+                for(;;){
+                    if(x0>=0&&x0<width&&y0>=0&&y0<height){
+                        long pos=2+((long)y0*width+x0)*3;
+                        buf[pos]=buf[pos+1]=buf[pos+2]=255;
                     }
-                    if (x0 == x1 && y0 == y1) break;
-                    int e2 = err;
-                    if (e2 > -dx) { err -= dy; x0 += sx; }
-                    if (e2 < dy)  { err += dx; y0 += sy; }
+                    if(x0==x1&&y0==y1)break;
+                    int e2=err;
+                    if(e2>-dx){err-=dy; x0+=sx;}
+                    if(e2< dy){err+=dx; y0+=sy;}
                 }
-                cx = sx0; cy = sy0;
+                PUSH(fx,fy,sfx,sfy);   /* float edge */
+                cx=sx0; cy=sy0; fx=sfx; fy=sfy;
                 continue;
             }
 
-            float nums[4];
-            int need = (cmd == 'Q' ? 4 : 2);
-            for (int n = 0; n < need; n++) {
-                while (svg[i] == ' ' || svg[i] == ',' || svg[i] == '\n' || svg[i] == '\r' || svg[i] == '\t') i++;
-                int sgn = 1; if (svg[i] == '-') { sgn = -1; i++; }
-                float val = 0, frac = 0, scale10 = 0.1f;
-                while ((svg[i] >= '0' && svg[i] <= '9') || svg[i] == '.') {
-                    if (svg[i] == '.') { i++; while (svg[i] >= '0' && svg[i] <= '9') { frac += (svg[i++] - '0') * scale10; scale10 *= 0.1f; } break; }
-                    val = val * 10 + (svg[i++] - '0');
+            float n[4];
+            int need=(cmd=='Q')?4:2;
+            for(int k=0;k<need;++k){
+                while(svg[i]==' '||svg[i]==','||svg[i]=='\n'||svg[i]=='\r'||svg[i]=='\t')++i;
+                int sgn=1; if(svg[i]=='-'){sgn=-1;++i;}
+                float v=0,fr=0,s=0.1f;
+                while((svg[i]>='0'&&svg[i]<='9')||svg[i]=='.'){
+                    if(svg[i]=='.'){++i;
+                        while(svg[i]>='0'&&svg[i]<='9'){fr+=(svg[i++]-'0')*s; s*=0.1f;}
+                        break;}
+                    v=v*10+(svg[i++]-'0');
                 }
-                nums[n] = sgn * (val + frac);
+                n[k]=sgn*(v+fr);
             }
 
-            if (cmd == 'M') {
-                cx = (int)((nums[0] - minx) * scale + offx + 0.5f);
-                cy = (int)((nums[1] - miny) * scale + offy + 0.5f);
-                sx0 = cx; sy0 = cy;
+            if(cmd=='M'){
+                fx=(n[0]-minx)*scale+offx;
+                fy=(n[1]-miny)*scale+offy;
+                cx=(int)(fx+0.5f); cy=(int)(fy+0.5f);
+                sfx=fx; sfy=fy; sx0=cx; sy0=cy;
             }
-            else if (cmd == 'L') {
-                int x1 = (int)((nums[0] - minx) * scale + offx + 0.5f);
-                int y1 = (int)((nums[1] - miny) * scale + offy + 0.5f);
-                int x0 = cx, y0 = cy;
-                int dx = iabs(x1 - x0), sx = (x0 < x1 ? 1 : -1);
-                int dy = iabs(y1 - y0), sy = (y0 < y1 ? 1 : -1);
-                int err = (dx > dy ? dx : -dy) / 2;
-                for (;;) {
-                    if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
-                        long p = 2 + ((long)y0 * width + x0) * 3;
-                        buf[p] = buf[p + 1] = buf[p + 2] = 255;
+            else if(cmd=='L'){
+                float x1f=(n[0]-minx)*scale+offx;
+                float y1f=(n[1]-miny)*scale+offy;
+                int   x1 =(int)(x1f+0.5f);
+                int   y1 =(int)(y1f+0.5f);
+
+                /* stroke */
+                int x0=cx,y0=cy;
+                int dx=IABS(x1-x0), sx=(x0<x1?1:-1);
+                int dy=IABS(y1-y0), sy=(y0<y1?1:-1);
+                int err=(dx>dy?dx:-dy)/2;
+                for(;;){
+                    if(x0>=0&&x0<width&&y0>=0&&y0<height){
+                        long pos=2+((long)y0*width+x0)*3;
+                        buf[pos]=buf[pos+1]=buf[pos+2]=255;
                     }
-                    if (x0 == x1 && y0 == y1) break;
-                    int e2 = err;
-                    if (e2 > -dx) { err -= dy; x0 += sx; }
-                    if (e2 < dy)  { err += dx; y0 += sy; }
+                    if(x0==x1&&y0==y1)break;
+                    int e2=err;
+                    if(e2>-dx){err-=dy; x0+=sx;}
+                    if(e2< dy){err+=dx; y0+=sy;}
                 }
-                cx = x1; cy = y1;
+                PUSH(fx,fy,x1f,y1f);
+                cx=x1; cy=y1; fx=x1f; fy=y1f;
             }
-            else if (cmd == 'Q') {
-                float cpx = (nums[0] - minx) * scale + offx;
-                float cpy = (nums[1] - miny) * scale + offy;
-                float ex  = (nums[2] - minx) * scale + offx;
-                float ey  = (nums[3] - miny) * scale + offy;
+            else if(cmd=='Q'){
+                float cpx=(n[0]-minx)*scale+offx;
+                float cpy=(n[1]-miny)*scale+offy;
+                float exf=(n[2]-minx)*scale+offx;
+                float eyf=(n[3]-miny)*scale+offy;
 
-                float px = (float)cx, py = (float)cy;
-                float dx1 = fabsf(cpx - px), dy1 = fabsf(cpy - py);
-                float dx2 = fabsf(ex  - cpx), dy2 = fabsf(ey  - cpy);
-                float est = dx1 + dy1 + dx2 + dy2;
-                int segs = (int)(est / 2); if (segs < 4) segs = 4; if (segs > 1000) segs = 1000;
+                float px=fx, py=fy;
+                float est=FABS(cpx-px)+FABS(cpy-py)+FABS(exf-cpx)+FABS(eyf-cpy);
+                int segs_q=(int)(est/2); if(segs_q<4)segs_q=4; if(segs_q>1000)segs_q=1000;
 
-                for (int s = 1; s <= segs; s++) {
-                    float t = (float)s / segs;
-                    float omt = 1.0f - t;
-                    float qx = omt * omt * px + 2 * omt * t * cpx + t * t * ex;
-                    float qy = omt * omt * py + 2 * omt * t * cpy + t * t * ey;
+                for(int s=1;s<=segs_q;++s){
+                    float t=(float)s/segs_q, omt=1.f-t;
+                    float qx=omt*omt*px + 2*omt*t*cpx + t*t*exf;
+                    float qy=omt*omt*py + 2*omt*t*cpy + t*t*eyf;
 
-                    int x1 = (int)(qx + 0.5f), y1 = (int)(qy + 0.5f);
-                    int x0 = (int)(px + 0.5f), y0 = (int)(py + 0.5f);
-                    int dx = iabs(x1 - x0), sx = (x0 < x1 ? 1 : -1);
-                    int dy = iabs(y1 - y0), sy = (y0 < y1 ? 1 : -1);
-                    int err = (dx > dy ? dx : -dy) / 2;
-                    for (;;) {
-                        if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height) {
-                            long p = 2 + ((long)y0 * width + x0) * 3;
-                            buf[p] = buf[p + 1] = buf[p + 2] = 255;
+                    int x1=(int)(qx+0.5f), y1=(int)(qy+0.5f);
+                    int x0=(int)(px+0.5f), y0=(int)(py+0.5f);
+
+                    int dx=IABS(x1-x0), sx=(x0<x1?1:-1);
+                    int dy=IABS(y1-y0), sy=(y0<y1?1:-1);
+                    int err=(dx>dy?dx:-dy)/2;
+                    for(;;){
+                        if(x0>=0&&x0<width&&y0>=0&&y0<height){
+                            long pos=2+((long)y0*width+x0)*3;
+                            buf[pos]=buf[pos+1]=buf[pos+2]=255;
                         }
-                        if (x0 == x1 && y0 == y1) break;
-                        int e2 = err;
-                        if (e2 > -dx) { err -= dy; x0 += sx; }
-                        if (e2 < dy)  { err += dx; y0 += sy; }
+                        if(x0==x1&&y0==y1)break;
+                        int e2=err;
+                        if(e2>-dx){err-=dy; x0+=sx;}
+                        if(e2< dy){err+=dx; y0+=sy;}
                     }
-                    px = qx; py = qy;
+                    PUSH(px,py,qx,qy);
+                    px=qx; py=qy;
                 }
-                cx = (int)(ex + 0.5f); cy = (int)(ey + 0.5f);
+                fx=exf; fy=eyf; cx=(int)(fx+0.5f); cy=(int)(fy+0.5f);
             }
         }
 
+        /* ---- 4. non-zero winding fill --------------------------------------- */
+        for(int y=0;y<height;++y){
+            float py=y+0.5f;
+            for(int x=0;x<width;++x){
+                float px=x+0.5f;
+                int winding=0;
+
+                for(int s=0;s<cnt;++s){
+                    float x0=segs[4*s+0], y0=segs[4*s+1];
+                    float x1=segs[4*s+2], y1=segs[4*s+3];
+                    if(y0==y1)continue;                /* true horizontals only   */
+
+                    int upward=(y1>y0);
+                    float ymin=upward?y0:y1;
+                    float ymax=upward?y1:y0;
+
+                    if(py>=ymin && py<ymax){
+                        float ix=x0 + (py-y0)*(x1-x0)/(y1-y0);
+                        if(ix>=px) winding += upward ? 1 : -1;
+                    }
+                }
+                if(winding){
+                    long pos=2+((long)y*width+x)*3;
+                    buf[pos]=buf[pos+1]=buf[pos+2]=255;
+                }
+            }
+        }
+
+        free(segs);
         return buf;
     }
-
-
 
     //Default font for fishOS is jetbrains mono regular.
 
@@ -724,72 +769,6 @@ void start(uint64_t info){
         //Raster char
         int* bmap = svg_to_bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), svgToChr);
 
-        //Post processing (fill char)
-        /* ------------- robust glyph interior fill (edge flood-fill) ------------ */
-        int W = bmap[0];
-        int H = bmap[1];
-        int N = W * H;                      /* total pixel count (no metadata)    */
-
-        /* mark[i] = 0 → unvisited background
-        mark[i] = 1 → background reachable from the border (outside)          */
-        unsigned char *mark = (unsigned char *)malloc(N);
-        for (int i = 0; i < N; i++) {
-            mark[i] = 0;
-        }
-
-        /* simple FIFO queue for the flood-fill */
-        int *queue = (int *)malloc(N * sizeof(int));
-        int head = 0;
-        int tail = 0;
-
-        /* helper to push a pixel index into the queue if it is background */
-        void push_if_bg(int idx) {
-            long o = 2 + (long)idx * 3;
-            int bg = (bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0;
-            if (bg && mark[idx] == 0) {
-                mark[idx] = 1;
-                queue[tail++] = idx;
-            }
-        }
-
-        /* seed the flood-fill with every transparent border pixel */
-        for (int x = 0; x < W; x++) {
-            push_if_bg(x);
-            push_if_bg((H - 1) * W + x);
-        }
-        for (int y = 0; y < H; y++) {
-            push_if_bg(y * W);
-            push_if_bg(y * W + (W - 1));
-        }
-
-        /* breadth-first flood-fill of the outside region */
-        while (head < tail) {
-            int p  = queue[head++];
-            int py = p / W;
-            int px = p - py * W;
-
-            if (px > 0)          push_if_bg(p - 1);
-            if (px < W - 1)      push_if_bg(p + 1);
-            if (py > 0)          push_if_bg(p - W);
-            if (py < H - 1)      push_if_bg(p + W);
-        }
-
-        /* every background pixel NOT reachable from the border is inside → fill */
-        for (int i = 0; i < N; i++) {
-            if (mark[i] == 0) {
-                long o = 2 + (long)i * 3;
-                if ((bmap[o] | bmap[o + 1] | bmap[o + 2]) == 0) {
-                    bmap[o]     = 255;
-                    bmap[o + 1] = 255;
-                    bmap[o + 2] = 255;
-                }
-            }
-        }
-
-        free(queue);
-        free(mark);
-        /* ---------------------------------------------------------------------- */
-
         free(svgToChr);
 
         if (!bmap){
@@ -875,30 +854,57 @@ void start(uint64_t info){
     int scrollback_cursor = 0;
     int scrollback_size = 0;
 
-    void refresh_scrollback_render(){
+    void refresh_scrollback_render() {
+        int max_rows = screen_h / 24;
+
+        // First: figure out how many rows the current scrollback would occupy
+        int rows = 0;
+        int col = 0;
+        for (int i = 0; scrollback[i]; i++) {
+            int x_char = (int)(screen_w / 50 + (col * 16));
+            if (x_char + 16 > screen_w) {
+                col = 0;
+                rows++;
+            }
+            col++;
+        }
+        if (col != 0) rows++; // count last partial row
+
+        // Second: figure out scrollback_cursor so we only render the last visible part
+        int overflow = rows - max_rows;
+        if (overflow > 0) {
+            int skipped_rows = 0;
+            int i = 0;
+            int col2 = 0;
+            while (scrollback[i] && skipped_rows < overflow) {
+                int x_char = (int)(screen_w / 50 + (col2 * 16));
+                if (x_char + 16 > screen_w) {
+                    col2 = 0;
+                    skipped_rows++;
+                }
+                col2++;
+                i++;
+            }
+            scrollback_cursor = i;
+        } else {
+            scrollback_cursor = 0;
+        }
+
+        // Third: render from scrollback_cursor onward
         int column = 0;
         int row = 0;
-        int skiprow = 0;
-        int howmanycharsinarow = 0;
-        for (int index = 0; !(scrollback[index] == '\0'); index++){
+        for (int i = scrollback_cursor; scrollback[i]; i++) {
             int x_char = (int)(screen_w / 50 + (column * 16));
             int y_char = (int)(24 * row);
 
-            if (x_char + 16 > screen_w){
+            if (x_char + 16 > screen_w) {
                 column = 0;
                 row++;
-                if (!howmanycharsinarow){
-                    howmanycharsinarow = index;
-                }
-                if ((int)(24 * row) > screen_h){
-                    skiprow++;
-                }
+                x_char = (int)(screen_w / 50);
+                y_char = (int)(24 * row);
             }
 
-            if (row >= skiprow){
-                draw_chr(scrollback[index], 16 * column, 24 * (row - skiprow), 1, screen);
-            }
-
+            draw_chr(scrollback[i], x_char, y_char, 1, screen);
             column++;
         }
     }

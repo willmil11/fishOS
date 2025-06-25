@@ -12,7 +12,7 @@ or begin
 end
 
 # Compile C kernel
-gcc -ffreestanding -m64 -mno-red-zone -O0 -g -fno-omit-frame-pointer -fno-inline -fno-stack-protector -c fishOS.c -o fishOS.o
+gcc -ffreestanding -m64 -mno-red-zone -O3 -g -fno-omit-frame-pointer -fno-inline -fno-stack-protector -c fishOS.c -o fishOS.o
 or begin
     echo "[-] Failed to compile fishOS.c"
     exit 1
