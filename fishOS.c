@@ -1,13 +1,23 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __builtin_memcpy
+#undef memcpy                       /* turn off compiler builtin */
+#endif
+#ifdef __builtin_memset
+#undef memset             /* turn off compiler builtin */
+#endif
+#ifdef __builtin_memmove
+#undef memmove            /* turn off compiler builtin */
+#endif
 
 void *malloc (uint32_t n);
 void  free   (void *ptr);
 void *realloc(void *ptr, uint32_t n);
 
-uint64_t __stack_chk_guard = 0xdeadbeefcafebabe;
-void __attribute__((noreturn)) __stack_chk_fail(void) { for(;;)__asm__("cli;hlt"); }
+uint64_t __stack_chk_guard = 0xdeadbeef;
 
 typedef struct { uint32_t type, size; }                        multiboot_tag_t;
 typedef struct { uint32_t type, size, entry_size, entry_ver; } multiboot_tag_mmap_t;
@@ -37,6 +47,115 @@ static void draw_rect(uint32_t x,uint32_t y,uint32_t w,uint32_t h,uint32_t c){
 #define SMALL_LIM  128u
 #define BUMP_LIM   (64u*1024u)
 
+#define SLAB_MAX        512
+#define SLAB_CHUNK_SIZE (64 * 1024) //IF YOU SET THIS BELOW 64KB (64 * 1024) EVERYTHING WILL EXPLODE
+#define SLAB_CLASSES    6
+
+static const uint16_t slab_sz[SLAB_CLASSES] = {16, 32, 64, 128, 256, 512};
+
+typedef struct slab_chunk {
+    struct slab_chunk *next;
+    uint16_t used;          /* how many objects in use            */
+    uint16_t obj_sz;        /* 8 … 256                            */
+    uint8_t *free_list;     /* singly-linked list of free objects */
+} slab_chunk_t;
+
+#define SLAB_HDR  sizeof(slab_chunk_t*)
+
+static slab_chunk_t *slab_cache[SLAB_CLASSES];   /* six size-class heads */
+
+/* ---- forward decl so slab_free / realloc can call it before the body --- */
+static inline void* v2p(uint64_t v);
+
+
+/* helper: class index for a size, or −1 if > SLAB_MAX */
+static inline int slab_class(uint32_t n)
+{
+    for (int i = 0; i < SLAB_CLASSES; ++i)
+        if (n <= slab_sz[i]) return i;
+    return -1;
+}
+
+static slab_chunk_t *slab_new_chunk(int cls)
+{
+    /* header + 64 KiB payload                                      */
+    uint32_t need = sizeof(slab_chunk_t) + SLAB_CHUNK_SIZE;
+    slab_chunk_t *c = (slab_chunk_t*)malloc(need);
+    if (!c) return 0;
+
+    c->obj_sz   = slab_sz[cls];
+    c->used     = 0;
+    /* link it as new head of the class list */
+    c->next            = slab_cache[cls];
+    slab_cache[cls]    = c;
+
+    /* carve the payload into a freelist: each slot = HDR+payload   */
+    uint32_t slot = ALIGN8(c->obj_sz + SLAB_HDR);
+    uint8_t *start = (uint8_t*)(c + 1);
+    uint8_t *p     = start;
+    while (p + slot <= start + SLAB_CHUNK_SIZE) {
+        *(uint8_t**)p = p + slot;      /* link next free object     */
+        p += slot;
+    }
+    *(uint8_t**)(p - slot) = 0;         /* last node → NULL         */
+    c->free_list = start;               /* head of freelist         */
+    return c;
+}
+
+static void *slab_alloc(uint32_t n)
+{
+    int cls = slab_class(n);
+    if (cls < 0) return 0;                  /* not a slab size        */
+
+    // Reuse chunks with free space
+    slab_chunk_t *c = slab_cache[cls];
+    while (c && !c->free_list)
+        c = c->next;
+
+    if (!c) {
+        c = slab_new_chunk(cls);
+        if (!c) return 0;
+        c->next = slab_cache[cls];
+        slab_cache[cls] = c;
+    }
+
+    uint8_t *obj = c->free_list;            /* pop from freelist      */
+    c->free_list = *(uint8_t**)obj;
+    c->used++;
+
+    /* store back-pointer to owning chunk just before user area      */
+    ((slab_chunk_t**)obj)[0] = c;        /* back-pointer             */
+    return obj + SLAB_HDR;               /* give user the payload    */
+}
+
+static bool slab_free(void *ptr)
+{
+    if (!ptr) return false;
+
+    /* recover back-pointer written by slab_alloc()  */
+    uint8_t      *raw = (uint8_t*)ptr - SLAB_HDR;
+    slab_chunk_t *c   = *(slab_chunk_t**)raw;
+    /* Make sure the recovered pointer is inside a mapped region
+       before we dare to touch the chunk header.                    */
+    if (!c || !v2p((uint64_t)c) ||          /* not RAM → not a slab */
+        c->obj_sz > SLAB_MAX ||
+        (uint8_t*)ptr - (uint8_t*)(c + 1) >= SLAB_CHUNK_SIZE)
+        return false;                       /* not a slab allocation  */
+
+    uint8_t *obj = raw;                 /* push it back on freelist */
+    *(uint8_t**)obj = c->free_list;         /* push back to freelist  */
+    c->free_list   = obj;
+    if (--c->used == 0) {                   /* whole chunk empty      */
+        /* unlink from cache list                                    */
+        int cls = slab_class(c->obj_sz);
+        slab_chunk_t **pp = &slab_cache[cls];
+        while (*pp && *pp != c) pp = &(*pp)->next;
+        if (*pp) *pp = c->next;
+        free(c);                           /* give 64 KiB back       */
+    }
+    return true;
+}
+
 typedef struct blk { uint32_t size_flags; struct blk* next,*prev; } blk_t;
 
 #define MAX_REGIONS 32
@@ -52,9 +171,12 @@ static uint64_t heap_base = 0;
 
 __attribute__((noreturn)) void PANIC(void)
 {
+    draw_rect(0, 0, screen_w, screen_h, rgb(0, 0, 255));
     for(;;) __asm__("cli; hlt");
 }
 #define ASSERT(c) do { if(!(c)) PANIC(); } while(0)
+
+void __attribute__((noreturn)) __stack_chk_fail(void) { PANIC(); }
 
 static inline void verify(blk_t *b) {
     uint32_t sz = b->size_flags & SIZE_MASK;
@@ -89,6 +211,46 @@ static void heap_selftest(void) {
         free(b);  free(c);
 }
 
+/* Simple, built-in-safe versions — good enough for early kernel */
+static inline void *memset(void *dst, int val, size_t n)
+{
+    uint8_t *d = (uint8_t*)dst;
+    while (n--) *d++ = (uint8_t)val;
+    return dst;
+}
+
+static inline void *memmove(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = (uint8_t*)dst;
+    const uint8_t *s = (const uint8_t*)src;
+
+    if (s < d && d < s + n) {            /* overlap → copy backwards */
+        d += n;  s += n;
+        while (n--) *--d = *--s;
+    } else {                             /* normal forward copy      */
+        while (n--) *d++ = *s++;
+    }
+    return dst;
+}
+
+/* memcpy can just forward to memmove now */
+static inline void *memcpy(void *dst, const void *src, size_t n)
+{
+    return memmove(dst, src, n);
+}
+
+#define NBUCKETS 32
+static blk_t *bins[NBUCKETS];
+static blk_t *rover[NBUCKETS];
+
+static inline int bucket_index(uint32_t sz) {
+    if (sz <= 32) return 0;
+    int i = 1;
+    sz >>= 6;
+    while (sz) { sz >>= 1; i++; }
+    return (i >= NBUCKETS) ? NBUCKETS - 1 : i;
+}
+
 static inline void* v2p(uint64_t v){
     for(int i=0;i<n_region;++i)
         if(v>=region[i].v && v<region[i].v+region[i].sz)
@@ -116,10 +278,10 @@ static inline void put_footer(blk_t *b) {
     *(uint32_t*)v2p(v_footer_addr) = b->size_flags & SIZE_MASK;
 }
 
-static inline blk_t** pick_bin(uint32_t sz, blk_t ***rover){
-    if(sz<=TINY_LIM){ *rover=&rov_tiny;  return &bin_tiny; }
-    if(sz<=SMALL_LIM){*rover=&rov_small; return &bin_small;}
-    *rover=&rov_big;  return &bin_big;
+static inline blk_t** pick_bin(uint32_t sz, blk_t ***rover_out) {
+    int i = bucket_index(sz);
+    *rover_out = &rover[i];
+    return &bins[i];
 }
 static inline void list_push(blk_t *b){
     //verify(b);
@@ -134,6 +296,8 @@ static inline void list_remove(blk_t *b){
     if(b->next) b->next->prev=b->prev;
     if(*rov==b) *rov=b->next?b->next:*head;
 }
+
+#define absf(x) ((x) < 0 ? -(x) : (x))
 
 static void heap_init(void){
     //if(!heap_bytes) return;
@@ -159,11 +323,18 @@ static void heap_init(void){
     b->size_flags = (uint32_t)(avail - HEADER_FOOTER);  /* payload size   */
     ASSERT((b->size_flags & SIZE_MASK) >= MIN_PAYLOAD_FREE);
     put_footer(b);
-    bin_big=rov_big=b; b->next=b->prev=0;
+    int i = bucket_index(b->size_flags & SIZE_MASK);
+    bins[i] = rover[i] = b;
+    b->next = b->prev = 0;
 }
 
 void *malloc(uint32_t n){
     if(!n) return 0;
+
+    if (n && n <= SLAB_MAX) {              /* NEW: tiny? use slab   */
+        void *s = slab_alloc(n);
+        if (s) return s;
+    }
 
     if(n>=BUMP_LIM && bump_top){
         uint32_t sz=ALIGN8(n);
@@ -179,29 +350,48 @@ void *malloc(uint32_t n){
     uint32_t sz=ALIGN8(n);
     if(sz<MIN_PAYLOAD_FREE) sz=MIN_PAYLOAD_FREE;
 
-    blk_t **rov, **bin = pick_bin(sz, &rov);
+    int idx = bucket_index(sz);
     blk_t *best = 0;
     uint32_t best_sz = ~0u;
 
-    for (;;) {
-        for (int phase = 0; phase < 2 && !best; ++phase) {
-            blk_t *cur = (phase == 0 ? *rov : *bin);
-            for (; cur; cur = cur->next) {
+    /* Step 1: Best-fit in ideal bin */
+    for (blk_t *cur = bins[idx]; cur; cur = cur->next) {
+        uint32_t csz = cur->size_flags & SIZE_MASK;
+        if (csz >= sz && csz < best_sz) {
+            best = cur;
+            best_sz = csz;
+        }
+    }
+    if (!best) {
+        /* Step 2: Best-fit in upper bins */
+        for (int i = idx + 1; i < NBUCKETS; ++i) {
+            for (blk_t *cur = bins[i]; cur; cur = cur->next) {
                 uint32_t csz = cur->size_flags & SIZE_MASK;
                 if (csz >= sz && csz < best_sz) {
-                    best = cur; best_sz = csz;
-                    //verify(best);
-                    if (csz == sz) break;
+                    best = cur;
+                    best_sz = csz;
                 }
             }
+            if (best) break;  // stop as soon as something found
         }
 
-        if (best) break;
-        if (bin == &bin_big) return 0;
-
-        if (bin == &bin_tiny) { bin = &bin_small; rov = &rov_small; }
-        else                  { bin = &bin_big;  rov = &rov_big;  }
+        /* Step 3: Best-fit in lower bins */
+        if (!best) {
+            for (int i = idx - 1; i >= 0; --i) {
+                for (blk_t *cur = bins[i]; cur; cur = cur->next) {
+                    uint32_t csz = cur->size_flags & SIZE_MASK;
+                    if (csz >= sz && csz < best_sz) {
+                        best = cur;
+                        best_sz = csz;
+                    }
+                }
+                if (best) break;
+            }
+        }
     }
+
+    blk_t **rov = &rover[bucket_index(best_sz)];
+    blk_t **bin = &bins[bucket_index(best_sz)];
 
     if(!best) return 0;
 
@@ -227,6 +417,9 @@ void *malloc(uint32_t n){
 // Replace your free function with this one.
 void free(void *ptr) {
     if (!ptr) return;
+
+    /* NEW: early-out for slab objects */
+    if (slab_free(ptr)) return;
 
     if (ptr >= (void*)bump_base && ptr < (void*)bump_end) {
         uint8_t *hdr = (uint8_t*)ptr - 4;
@@ -272,6 +465,22 @@ void free(void *ptr) {
 void *realloc(void *old, uint32_t n) {
     if (!old) return malloc(n);
     if (!n) { free(old); return 0; }
+
+    slab_chunk_t *chunk = *(((slab_chunk_t**)old) - 1);
+    /* Only treat it as a slab object if the back-pointer really
+       looks like a valid chunk *inside* RAM.                      */
+    if (chunk && v2p((uint64_t)chunk) &&
+        chunk->obj_sz && chunk->obj_sz <= SLAB_MAX) {
+        /* it *is* a slab allocation */
+        if (n <= chunk->obj_sz) return old;          /* still fits */
+
+        /* grow outside the slab */
+        void *nu = malloc(n);
+        if (!nu) return 0;
+        memcpy(nu, old, chunk->obj_sz);
+        slab_free(old);
+        return nu;
+    }
 
     blk_t *b = (blk_t*)((uint8_t*)old - 4);
     //verify(b);
@@ -708,72 +917,148 @@ void start(uint64_t info){
         font_chars_length++;
     }
 
+    //Char_raster_cache format
+    //[indexOfChar, scale, width, height, r, g, b, ..., indexOfChar, ...]
+    int *char_raster_cache = malloc(1 * sizeof(int)); //Just exists for now.
+    int char_raster_cache_length = 1;
+    char_raster_cache[0] = -1; //Signal that cache is empty.
+    bool cache_chars = true;
+    if (!char_raster_cache){
+        cache_chars = false;
+    }
+
     int* draw_chr(char chr, int x, int y, float size, int* screen_) {
         //Check if char is in font_chars
         bool found = false;
-        char* svgToChr = malloc(1 * sizeof(char));
+        int char_index;
         for (int index = 0; index < font_chars_length; index++) {
             if (font_chars[index][0][0] == chr){
                 found = true;
-
-                //Copy svg of char to svgToChar with dynamic memory scaling...
-                int subindex;
-                for (subindex = 0; font_chars[index][1][subindex] != '\0'; subindex++){
-                    char* tmp = realloc(svgToChr, subindex + 2);
-                    if (!tmp) { 
-                        free(svgToChr); 
-                        return NULL;
-                    }
-                    svgToChr = tmp;
-                    svgToChr[subindex] = font_chars[index][1][subindex];
-                }
-                svgToChr[subindex] = '\0';
-
+                char_index = index;
                 break;
             }
         }
         
         //If char doesn't exist in font.
         if (!found){
-            free(svgToChr);
             return NULL;
         }
 
         //Check if size is correct
         if (!(size > 0)){
-            free(svgToChr);
             return NULL;
         }
 
         //Check pos
         if (x < 0 || x >= (int)screen_w){
-            free(svgToChr);
             return NULL;
         }
 
         if (y < 0 || y >= (int)screen_h){
-            free(svgToChr);
             return NULL;
         }
 
         if (screen_[0] < screen_w || screen_[0] > screen_w){
-            free(svgToChr);
             return NULL;
         }
         
         if (screen_[1] < screen_h || screen_[1] > screen_h){
-            free(svgToChr);
             return NULL;
+        }
+
+        found = false;
+        int* bmap = malloc(1 * sizeof(int));
+        if (!bmap){
+            //Shit
+            return NULL;
+        }
+        int SCALE_PRECISION = 1000;
+        if (cache_chars){
+            //We need to check if the char is in cache.
+            if (!(char_raster_cache[0] == -1)){
+                //At least a char must be cached. Check for index and scale.
+                int index = 0;
+                while (index < char_raster_cache_length){
+                    if (char_raster_cache[index] == char_index){
+                        //This is the char then.
+                        //Check if scale is right ofc
+                        if (absf(size - (float)char_raster_cache[index + 1] / (float)SCALE_PRECISION) < 0.001f) {
+                            //Damn its perfect
+                            //Set found to true and collect bmap
+                            found = true;
+                            bmap = realloc(bmap, ((char_raster_cache[index + 2] * char_raster_cache[index + 3] * 3) + 2) * sizeof(int));
+                            //We got the space, collect bmap
+                            for (int subindex = index + 2; subindex < index + (char_raster_cache[index + 2] * char_raster_cache[index + 3]) * 3 + 4; subindex++){
+                                bmap[subindex - (index + 2)] = char_raster_cache[subindex];
+                            }
+                            //Got the bmap
+                            break;
+                        }
+                    }
+                    index += (char_raster_cache[index + 2] * char_raster_cache[index + 3]) * 3 + 4;
+                }
+                if (!found){
+                    free(bmap);
+                    bmap = svg_to_bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), font_chars[char_index][1]);
+                    if (!bmap){
+                        return NULL;
+                    }
+                }
+            }
+            else{
+                free(bmap);
+                bmap = svg_to_bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), font_chars[char_index][1]);
+                if (!bmap){
+                    return NULL;
+                }
+            }
+        }
+
+        if (!found){
+            //Char was not found in cache database.
+            if (char_raster_cache[0] == -1){
+                //It's not init
+                int* tmp = realloc(char_raster_cache, ((bmap[0] * bmap[1] * 3) + 4) * sizeof(int));
+                if (tmp){
+                    //Nice
+                    char_raster_cache = tmp;
+                    //We could realloc meaning now we can override the contents of char_raster_cache 
+                    //with the index, scale and bmap
+                    char_raster_cache[0] = char_index;
+                    int quantized_scale = (int)(size * SCALE_PRECISION + 0.5f);
+                    char_raster_cache[1] = quantized_scale;
+                    for (int index = 0; index < (bmap[0] * bmap[1]) * 3 + 2; index++){
+                        char_raster_cache[index + 2] = bmap[index];
+                    }
+                    char_raster_cache_length = 4 + (bmap[0] * bmap[1] * 3); //char_index + scale + width + height + pixels
+                    //Copy successful.
+                }
+                //else we give up on trying to cache it
+            }
+            else{
+                //It's init this makes things slightly more complicated as we
+                //now have to use char_raster_cache_length
+                int* tmp = realloc(char_raster_cache, ((bmap[0] * bmap[1] * 3) + 4 + char_raster_cache_length) * sizeof(int));
+                if (tmp){
+                    //Cool we could make it long enough
+                    //Assign
+                    char_raster_cache = tmp;
+                    //Now we append our shit
+                    //char_raster_cache_length started at 1 and we always add to it meaning
+                    //that as an index it will always be 1 over the last element which is good here.
+                    char_raster_cache[char_raster_cache_length] = char_index;
+                    int quantized_scale = (int)(size * SCALE_PRECISION + 0.5f);
+                    char_raster_cache[char_raster_cache_length + 1] = quantized_scale;
+                    for (int index = 0; index < (bmap[0] * bmap[1]) * 3 + 2; index++){
+                        char_raster_cache[index + 2 + char_raster_cache_length] = bmap[index];
+                    }
+                    char_raster_cache_length += 4 + (bmap[0] * bmap[1] * 3);
+                }
+                //Here we also give up trying if it fails
+            }
         }
 
         //Raster char
-        int* bmap = svg_to_bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), svgToChr);
-
-        free(svgToChr);
-
-        if (!bmap){
-            return NULL;
-        }
 
         for (int index = 0; index < bmap[0] * bmap[1]; index++) {
             int r = bmap[2 + index * 3 + 0];
@@ -925,10 +1210,13 @@ void start(uint64_t info){
         render_frame(screen);
     }
 
+    char* chars_joined = malloc(font_chars_length + 1);
+    for (int index = 0; index < font_chars_length; index++){
+        chars_joined[index] = font_chars[index][0][0];
+    }
+    chars_joined[font_chars_length] = '\0';
     while (true){
-        for (int index = 0; index < font_chars_length; index++){
-            print(font_chars[index][0]);
-        }
+        print(chars_joined);
     }
 
     for (;;) __asm__("cli; hlt"); 
