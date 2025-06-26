@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.6
+# 🐟 FishOS 0.0.7
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -15,6 +15,7 @@ The iso works on x86, you can run ```qemu-system-x86_64 -cdrom fishos.iso -m 102
 
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.7 — Slightly better compile.fish.
 - 0.0.6 — Faster memory allocator and char caching for faster than ever print(). Also the test displayed on screen changed: we print() all of the available chars in one call as a single string in a loop instead of each char one after the other in a loop this is more representative of print() performance and char caching effectiveness.
 - 0.0.5 — Print function scrollback is fixed, way better fill algorithm for chars.
 - 0.0.4 — PRINT FUNCTION WORKS + MEMORY ALLOCATOR FIXED + FINALLY

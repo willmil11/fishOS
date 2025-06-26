@@ -36,10 +36,10 @@ or begin
     exit 1
 end
 
-echo "[*] Build complete. Running..."
-#We give 1gb ram with -m 1024 but you can change it.
-qemu-system-x86_64 -cdrom fishos.iso -display sdl --accel kvm -m 1024
-
 rm boot.o fishOS.o kernel.elf
 rm -rf iso
 echo "[*] Cleaned up build artifacts."
+
+echo "[*] Build complete. Running..."
+#We give 1gb ram with -m 1024 but you can change it.
+qemu-system-x86_64 -cdrom fishos.iso -display sdl --accel kvm -m 1024
