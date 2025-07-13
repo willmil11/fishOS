@@ -152,5 +152,5 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.4m.fd \
     -drive if=pflash,format=raw,file=ovmf_vars.fd \
     -cdrom fishos.iso \
-    -m 1024 \
+    -m 512 \
     -display sdl --accel kvm

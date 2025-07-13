@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.8
+# 🐟 FishOS 0.0.9
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -50,6 +50,7 @@ sudo apk add fish
 
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.9 — Major upgrade to print system, now supports all utf8 + emojis, emojis rendering is very temporarily broken because of a missing svg command, font is more accurate now, still size and position problems but way better than before. Also fixed a major bug in the slab part of the memory allocator :) For now at boot just spams "Hello, fishos!".
 - 0.0.8 — Major upgrade to compile.fish now auto dependency installing + os now boots on uefi systems + better screen res detection + better readme.
 - 0.0.7 — Slightly better compile.fish.
 - 0.0.6 — Faster memory allocator and char caching for faster than ever print(). Also the test displayed on screen changed: we print() all of the available chars in one call as a single string in a loop instead of each char one after the other in a loop this is more representative of print() performance and char caching effectiveness.
