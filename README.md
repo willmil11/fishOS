@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.13
+# 🐟 FishOS 0.0.14
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -55,6 +55,7 @@ sudo apk add fish
 
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.14 — Readme fix again (again).
 - 0.0.13 — Readme fix again.
 - 0.0.12 — Readme fix.
 - 0.0.11 — Emoji rendering is fixed, font rendering is fixed (FINALLLLYYYYY), just don't breathe near it wrong or it WILL kernel panic.
@@ -80,6 +81,7 @@ Notes: It works that's it. For now it boots and does something interesting, it's
 - OVMF_CODE.4m.fd -> a file so qemu can do uefi.
 - ovmf_vars.fd -> another file so qemu can do uefi.
 - README.md -> what you're reading rn.
+- readme_image_1.png -> Current state at boot section image.
 - LICENSE -> the license.
 
 # License
