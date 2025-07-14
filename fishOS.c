@@ -6,13 +6,13 @@
 #include "font_chars.c"
 
 #ifdef __builtin_memcpy
-#undef memcpy                       /* turn off compiler builtin */
+#undef memcpy
 #endif
 #ifdef __builtin_memset
-#undef memset             /* turn off compiler builtin */
+#undef memset
 #endif
 #ifdef __builtin_memmove
-#undef memmove            /* turn off compiler builtin */
+#undef memmove
 #endif
 
 void *malloc (uint32_t n);
@@ -57,65 +57,54 @@ static const uint16_t slab_sz[SLAB_CLASSES] = {16, 32, 64, 128, 256, 512};
 
 typedef struct slab_chunk {
     struct slab_chunk *next;
-    uint16_t used;          /* how many objects in use            */
-    uint16_t obj_sz;        /* 8 … 256                            */
-    uint8_t *free_list;     /* singly-linked list of free objects */
+    uint16_t used;
+    uint16_t obj_sz;
+    uint8_t *free_list;
 } slab_chunk_t;
 
-/* per-object header (kept 16 bytes / 8-byte aligned) */
 typedef struct {
-    slab_chunk_t *chunk;   /* back-pointer to owning chunk   */
-    uint32_t      req_sz;  /* exact size requested by user   */
-    uint32_t      pad;     /* reserved / keeps alignment     */
+    slab_chunk_t *chunk;
+    uint32_t      req_sz;
+    uint32_t      pad;
 } slab_hdr_t;
 #define SLAB_HDR  sizeof(slab_hdr_t)
 
-static slab_chunk_t *slab_cache[SLAB_CLASSES];   /* six size-class heads */
+static slab_chunk_t *slab_cache[SLAB_CLASSES];
 
-/* ---- forward decl so slab_free / realloc can call it before the body --- */
 static inline void* v2p(uint64_t v);
 
-
-/* helper: class index for a size, or −1 if > SLAB_MAX */
-static inline int slab_class(uint32_t n)
-{
+static inline int slab_class(uint32_t n){
     for (int i = 0; i < SLAB_CLASSES; ++i)
         if (n <= slab_sz[i]) return i;
     return -1;
 }
 
-static slab_chunk_t *slab_new_chunk(int cls)
-{
-    /* header + 64 KiB payload                                      */
+static slab_chunk_t *slab_new_chunk(int cls){
     uint32_t need = sizeof(slab_chunk_t) + SLAB_CHUNK_SIZE;
     slab_chunk_t *c = (slab_chunk_t*)malloc(need);
     if (!c) return 0;
 
     c->obj_sz   = slab_sz[cls];
     c->used     = 0;
-    /* link it as new head of the class list */
     c->next            = slab_cache[cls];
     slab_cache[cls]    = c;
 
-    /* carve the payload into a freelist: each slot = HDR+payload   */
     uint32_t slot = ALIGN8(c->obj_sz + SLAB_HDR);
     uint8_t *start = (uint8_t*)(c + 1);
     uint8_t *p     = start;
     while (p + slot <= start + SLAB_CHUNK_SIZE) {
-        *(uint8_t**)p = p + slot;      /* link next free object     */
+        *(uint8_t**)p = p + slot;
         p += slot;
     }
-    *(uint8_t**)(p - slot) = 0;         /* last node → NULL         */
-    c->free_list = start;               /* head of freelist         */
+    *(uint8_t**)(p - slot) = 0;
+    c->free_list = start;
     return c;
 }
 
-static void *slab_alloc(uint32_t n)
-{
+static void *slab_alloc(uint32_t n){
     int cls = slab_class(n);
-    if (cls < 0) return 0;                  /* not a slab size        */
+    if (cls < 0) return 0;
 
-    // Reuse chunks with free space
     slab_chunk_t *c = slab_cache[cls];
     while (c && !c->free_list)
         c = c->next;
@@ -125,51 +114,50 @@ static void *slab_alloc(uint32_t n)
         if (!c) return 0;
     }
 
-    uint8_t *obj = c->free_list;            /* pop from freelist      */
+    uint8_t *obj = c->free_list;
     c->free_list = *(uint8_t**)obj;
     c->used++;
 
-    /* fill header                                                    */
     slab_hdr_t *h = (slab_hdr_t*)obj;
     h->chunk  = c;
     h->req_sz = n;
 
-    return obj + SLAB_HDR;               /* give user the payload    */
+    return obj + SLAB_HDR;
 }
 
-static bool slab_free(void *ptr)
-{
+static bool slab_free(void *ptr){
     if (!ptr) return false;
 
-    /* recover back-pointer written by slab_alloc()  */
     uint8_t      *raw = (uint8_t*)ptr - SLAB_HDR;
     slab_chunk_t *c   = *(slab_chunk_t**)raw;
-    /* Make sure the recovered pointer is inside a mapped region
-       before we dare to touch the chunk header.                    */
-    if (!c || !v2p((uint64_t)c) ||          /* not RAM → not a slab */
+    if (!c || !v2p((uint64_t)c) ||
         c->obj_sz > SLAB_MAX ||
         (uint8_t*)ptr - (uint8_t*)(c + 1) >= SLAB_CHUNK_SIZE)
-        return false;                       /* not a slab allocation  */
+        return false;
 
-    uint8_t *obj = raw;                 /* push it back on freelist */
-    *(uint8_t**)obj = c->free_list;         /* push back to freelist  */
+    uint8_t *obj = raw;
+    *(uint8_t**)obj = c->free_list;
     c->free_list   = obj;
-    if (--c->used == 0) {                   /* whole chunk empty      */
-        /* unlink from cache list                                    */
+    if (--c->used == 0) {
         int cls = slab_class(c->obj_sz);
         slab_chunk_t **pp = &slab_cache[cls];
         while (*pp && *pp != c) pp = &(*pp)->next;
         if (*pp) *pp = c->next;
-        free(c);                           /* give 64 KiB back       */
+        free(c);
     }
     return true;
 }
 
-typedef struct blk { uint32_t size_flags; struct blk* next,*prev; } blk_t;
+typedef struct blk { 
+    uint32_t size_flags; struct blk* next,*prev; 
+} blk_t;
 
 #define MAX_REGIONS 32
-typedef struct { uint64_t p,v,sz; } region_t;
-static region_t region[MAX_REGIONS]; static int n_region;
+typedef struct { 
+    uint64_t p,v,sz; 
+} region_t;
+static region_t region[MAX_REGIONS]; 
+static int n_region;
 
 static blk_t *bin_tiny,*bin_small,*bin_big;
 static blk_t *rov_tiny,*rov_small,*rov_big;
@@ -178,26 +166,24 @@ static uint8_t *bump_base,*bump_top,*bump_end;
 
 static uint64_t heap_base = 0;
 
-__attribute__((noreturn)) void PANIC(void)
-{
+__attribute__((noreturn)) void PANIC(void){
     draw_rect(0, 0, screen_w, screen_h, rgb(0, 0, 255));
     for(;;) __asm__("cli; hlt");
 }
 #define ASSERT(c) do { if(!(c)) PANIC(); } while(0)
 
-void __attribute__((noreturn)) __stack_chk_fail(void) { PANIC(); }
+void __attribute__((noreturn)) __stack_chk_fail(void) { 
+    PANIC(); 
+}
 
 static inline void verify(blk_t *b) {
     uint32_t sz = b->size_flags & SIZE_MASK;
 
-    /* size and alignment checks */
     ASSERT(sz >= MIN_PAYLOAD_FREE && ((uintptr_t)b & 7u) == 0);
 
-    /* header ↔ footer consistency */
     uint32_t *foot = (uint32_t *)((uint8_t *)b + 4 + sz);
     ASSERT(*foot == sz);
 
-    /* used blocks must not be on any free list */
     if (b->size_flags & FLAG_USED)
         ASSERT(b->next == NULL && b->prev == NULL);
 }
@@ -205,26 +191,18 @@ static inline void verify(blk_t *b) {
 static inline bool is_valid_block(blk_t *b) {
     if (!b) return false;
 
-    // The pointer 'b' has already been validated by v2p() in the caller,
-    // so we know it points to a valid physical address.
-
-    // Check header alignment
     if (((uintptr_t)b & 7u) != 0) return false;
 
     uint32_t sz = b->size_flags & SIZE_MASK;
 
-    // Check for a sane size. A garbage size could be tiny or huge.
-    if (sz < MIN_PAYLOAD_FREE || sz > 0x10000000) { // 256MB sanity limit
+    if (sz < MIN_PAYLOAD_FREE || sz > 0x10000000) { //Once i fix some other stuff remove that
         return false;
     }
 
-    // Calculate the physical address of the footer
     uint64_t footer_addr = (uint64_t)b + 4 + sz;
 
-    // IMPORTANT: Check if the calculated footer address is within a valid memory region
     bool footer_is_valid = false;
     for (int i = 0; i < n_region; ++i) {
-        // Check if footer_addr is within [region.p, region.p + region.sz)
         if (footer_addr >= region[i].p && footer_addr < (region[i].p + region[i].sz)) {
             footer_is_valid = true;
             break;
@@ -232,48 +210,44 @@ static inline bool is_valid_block(blk_t *b) {
     }
     
     if (!footer_is_valid) {
-        return false; // The footer is outside of all known RAM, do not touch it.
+        return false;
     }
 
-    // Now, and only now, is it safe to read from the footer address.
     uint32_t *foot = (uint32_t *)footer_addr;
     return *foot == sz;
 }
 
 static void heap_selftest(void) {
-        void *a = malloc(24);
-        void *b = malloc(24);
-        free(a);
-        void *c = malloc(24);
-        ASSERT(c == a);          /* recycled the block we just freed  */
-        free(b);  free(c);
+    void *a = malloc(24);
+    void *b = malloc(24);
+    free(a);
+    void *c = malloc(24);
+    ASSERT(c == a);
+    free(b); 
+    free(c);
 }
 
-/* Simple, built-in-safe versions — good enough for early kernel */
-static inline void *memset(void *dst, int val, size_t n)
-{
+static inline void *memset(void *dst, int val, size_t n){
     uint8_t *d = (uint8_t*)dst;
     while (n--) *d++ = (uint8_t)val;
     return dst;
 }
 
-static inline void *memmove(void *dst, const void *src, size_t n)
-{
+static inline void *memmove(void *dst, const void *src, size_t n){
     uint8_t *d = (uint8_t*)dst;
     const uint8_t *s = (const uint8_t*)src;
 
-    if (s < d && d < s + n) {            /* overlap → copy backwards */
+    if (s < d && d < s + n) {
         d += n;  s += n;
         while (n--) *--d = *--s;
-    } else {                             /* normal forward copy      */
+    } 
+    else {
         while (n--) *d++ = *s++;
     }
     return dst;
 }
 
-/* memcpy can just forward to memmove now */
-static inline void *memcpy(void *dst, const void *src, size_t n)
-{
+static inline void *memcpy(void *dst, const void *src, size_t n){
     return memmove(dst, src, n);
 }
 
@@ -303,14 +277,12 @@ static inline uint64_t p2v(void *p){
     return 0;
 }
 
-// Replace your put_footer with this one.
 static inline void put_footer(blk_t *b) {
     uint64_t v_block_start = p2v(b);
-    if (v_block_start == 0) PANIC();          // header inside a hole ⇒ fatal
+    if (v_block_start == 0) PANIC();
 
     uint64_t v_footer_addr = v_block_start + 4 + (b->size_flags & SIZE_MASK);
 
-    /* NEW: confirm footer is in the same region */
     if (v2p(v_footer_addr) == 0) PANIC();
 
     *(uint32_t*)v2p(v_footer_addr) = b->size_flags & SIZE_MASK;
@@ -322,13 +294,11 @@ static inline blk_t** pick_bin(uint32_t sz, blk_t ***rover_out) {
     return &bins[i];
 }
 static inline void list_push(blk_t *b){
-    //verify(b);
     blk_t **rov,**head=pick_bin(b->size_flags&SIZE_MASK,&rov);
     b->prev=0; b->next=*head; if(*head) (*head)->prev=b; *head=b;
     if(!*rov) *rov=b;
 }
 static inline void list_remove(blk_t *b){
-    //verify(b);
     blk_t **rov,**head=pick_bin(b->size_flags&SIZE_MASK,&rov);
     if(b->prev) b->prev->next=b->next; else *head=b->next;
     if(b->next) b->next->prev=b->prev;
@@ -338,27 +308,25 @@ static inline void list_remove(blk_t *b){
 #define absf(x) ((x) < 0 ? -(x) : (x))
 
 static void heap_init(void){
-    //if(!heap_bytes) return;
-    /* -------------------------------------------------------------------
-       Put the very first free block right after the kernel image
-       ------------------------------------------------------------------- */
-    extern char _kernel_end;               /* provided by the linker script */
+    extern char _kernel_end;
 
-    uint64_t heap_start = ((uint64_t)&_kernel_end + 7) & ~7ULL; /* 8-byte align */
+    uint64_t heap_start = ((uint64_t)&_kernel_end + 7) & ~7ULL;
     heap_base = heap_start;
 
-    /* find the RAM region that contains heap_start */
     int r = -1;
-    for (int i = 0; i < n_region; ++i)
-        if (heap_start >= region[i].p &&
-            heap_start <  region[i].p + region[i].sz) { r = i; break; }
-    ASSERT(r >= 0);                        /* must be inside usable RAM   */
+    for (int i = 0; i < n_region; ++i){
+        if (heap_start >= region[i].p && heap_start <  region[i].p + region[i].sz) { 
+            r = i; 
+            break;
+        }
+    }
+    ASSERT(r >= 0);
 
     blk_t *b = (blk_t*)heap_start;
     uint64_t avail = region[r].p + region[r].sz - heap_start;
-    ASSERT(avail > MIN_FREE_BLOCK);        /* image can’t eat whole region */
+    ASSERT(avail > MIN_FREE_BLOCK);
 
-    b->size_flags = (uint32_t)(avail - HEADER_FOOTER);  /* payload size   */
+    b->size_flags = (uint32_t)(avail - HEADER_FOOTER);
     ASSERT((b->size_flags & SIZE_MASK) >= MIN_PAYLOAD_FREE);
     put_footer(b);
     int i = bucket_index(b->size_flags & SIZE_MASK);
@@ -369,7 +337,7 @@ static void heap_init(void){
 void *malloc(uint32_t n){
     if(!n) return 0;
 
-    if (n && n <= SLAB_MAX) {              /* NEW: tiny? use slab   */
+    if (n && n <= SLAB_MAX) {
         void *s = slab_alloc(n);
         if (s) return s;
     }
@@ -392,7 +360,6 @@ void *malloc(uint32_t n){
     blk_t *best = 0;
     uint32_t best_sz = ~0u;
 
-    /* Step 1: Best-fit in ideal bin */
     for (blk_t *cur = bins[idx]; cur; cur = cur->next) {
         uint32_t csz = cur->size_flags & SIZE_MASK;
         if (csz >= sz && csz < best_sz) {
@@ -401,7 +368,6 @@ void *malloc(uint32_t n){
         }
     }
     if (!best) {
-        /* Step 2: Best-fit in upper bins */
         for (int i = idx + 1; i < NBUCKETS; ++i) {
             for (blk_t *cur = bins[i]; cur; cur = cur->next) {
                 uint32_t csz = cur->size_flags & SIZE_MASK;
@@ -410,10 +376,9 @@ void *malloc(uint32_t n){
                     best_sz = csz;
                 }
             }
-            if (best) break;  // stop as soon as something found
+            if (best) break;
         }
 
-        /* Step 3: Best-fit in lower bins */
         if (!best) {
             for (int i = idx - 1; i >= 0; --i) {
                 for (blk_t *cur = bins[i]; cur; cur = cur->next) {
@@ -445,18 +410,16 @@ void *malloc(uint32_t n){
         best->size_flags = sz|FLAG_USED; put_footer(best);
     } else {
        best->size_flags |= FLAG_USED;
-       put_footer(best);          /* footer must match the header     */
+       put_footer(best);
     }
 
 
     return (uint8_t*)best + 4;
 }
 
-// Replace your free function with this one.
 void free(void *ptr) {
     if (!ptr) return;
 
-    /* NEW: early-out for slab objects */
     if (slab_free(ptr)) return;
 
     if (ptr >= (void*)bump_base && ptr < (void*)bump_end) {
@@ -468,14 +431,10 @@ void free(void *ptr) {
     }
 
     blk_t *b = (blk_t*)((uint8_t*)ptr - 4);
-    //ASSERT(b->size_flags & FLAG_USED);
-    //verify(b);
     b->size_flags &= SIZE_MASK;
     put_footer(b);
 
     uint64_t v_b = p2v(b);
-
-    // Right-coalesce
     uint64_t v_r = v_b + HEADER_FOOTER + (b->size_flags & SIZE_MASK);
     blk_t   *r   = (blk_t*)v2p(v_r);
     if (is_valid_block(r) && !(r->size_flags & FLAG_USED)) {
@@ -484,12 +443,9 @@ void free(void *ptr) {
         put_footer(b);
     }
 
-    // Left-coalesce
-    // NEW: Check that the address for the previous footer is valid memory
     if (v_b > heap_base && v2p(v_b - 4)) { 
         uint32_t psz = *(((uint32_t*)b) - 1) & SIZE_MASK;
-        // NEW: Additional sanity check on the size we read
-        if (psz > 0 && psz < 0x10000000) { // A reasonable size limit
+        if (psz > 0 && psz < 0x10000000) { //Once i fix some other stuff remove that
             uint64_t v_l = v_b - HEADER_FOOTER - psz;
             blk_t *l = (blk_t*)v2p(v_l);
             if (is_valid_block(l) && !(l->size_flags & FLAG_USED)) {
@@ -503,28 +459,25 @@ void free(void *ptr) {
     list_push(b);
 }
 
-// Replace your entire realloc function with this one.
 void *realloc(void *old, uint32_t n) {
     if (!old) return malloc(n);
-    if (!n) { free(old); return 0; }
+    if (!n) { 
+        free(old);
+        return 0; 
+    }
 
-    slab_hdr_t  *h      = (slab_hdr_t*)((uint8_t*)old - SLAB_HDR);
+    slab_hdr_t *h = (slab_hdr_t*)((uint8_t*)old - SLAB_HDR);
     slab_chunk_t *chunk = h->chunk;
 
-    /* Only treat it as a slab object if the back-pointer really
-       looks like a valid chunk *inside* RAM.                      */
-        // NEW, CORRECTED CHECK
     if (chunk && v2p((uint64_t)chunk) &&
         chunk->obj_sz > 0 && chunk->obj_sz <= SLAB_MAX &&
         (uint8_t*)old >= (uint8_t*)(chunk + 1) &&
         (uint8_t*)old < (uint8_t*)(chunk + 1) + SLAB_CHUNK_SIZE) {
-        /* it *is* a slab allocation */
-        if (n <= chunk->obj_sz) {       /* still fits in same slab slot */
-            h->req_sz = n;              /* remember logical size        */
+        if (n <= chunk->obj_sz) {
+            h->req_sz = n;
             return old;
         }
 
-        /* grow outside the slab */
         void *nu = malloc(n);
         if (!nu) return 0;
         memcpy(nu, old, h->req_sz);
@@ -533,12 +486,10 @@ void *realloc(void *old, uint32_t n) {
     }
 
     blk_t *b = (blk_t*)((uint8_t*)old - 4);
-    //verify(b);
     uint32_t cur = b->size_flags & SIZE_MASK;
     uint32_t need = ALIGN8(n);
     if (need < MIN_PAYLOAD_FREE) need = MIN_PAYLOAD_FREE;
 
-    // This part is now correct, assuming 'free' is also fixed.
     if (need <= cur) {
         uint32_t spare = cur - need;
         if (spare >= MIN_FREE_BLOCK) {
@@ -552,11 +503,9 @@ void *realloc(void *old, uint32_t n) {
                 list_push(tail);
             }
         }
-        //verify(b);
         return old;
     }
     
-    // --- In-place expansion logic (this was a secondary bug, but should be correct) ---
     uint64_t v_b_realloc = p2v(b);
     uint64_t v_r_realloc = v_b_realloc + HEADER_FOOTER + cur;
     blk_t *r = (blk_t*)v2p(v_r_realloc);
@@ -578,20 +527,17 @@ void *realloc(void *old, uint32_t n) {
                 b->size_flags = comb | FLAG_USED;
                 put_footer(b);
             }
-            //verify(b);
             return old;
         }
     }
 
-    // --- Malloc and Safe Copy ---
-    // --- Malloc and Copy ---
     void *nu = malloc(n);
     if (!nu) return 0;
 
     uint32_t copy_size = (cur < n) ? cur : n;
     memcpy(nu, old, copy_size);
 
-    free(old); // This call is now safe because free() is fixed
+    free(old);
     return nu;
 }
 
@@ -629,7 +575,6 @@ void start(uint64_t info){
             bump_base = (uint8_t*)(big_base + big_len - bump_sz);
             bump_top  = bump_base;
             bump_end  = (uint8_t*)(big_base + big_len);
-            /* NEW: add the bump region so v2p/p2v can translate it */
             ASSERT(n_region < MAX_REGIONS);
             region[n_region++] = (region_t){ (uint64_t)bump_base,
                                             (uint64_t)bump_base,
@@ -640,7 +585,6 @@ void start(uint64_t info){
     
     if (big_len) {
         ASSERT(n_region < MAX_REGIONS);
-        /* identity-map the region: virtual == physical */
         region[n_region++] = (region_t){ big_base, big_base, big_len };
     }
     for(tag=(void*)(info+8); tag->type;
@@ -652,7 +596,6 @@ void start(uint64_t info){
                 e=(void*)((uint8_t*)e+mm->entry_size))
                 if(e->type==MULTIBOOT_MEMORY_AVAILABLE && e->base!=big_base){
                     ASSERT(n_region<MAX_REGIONS);
-                    /* identity-map the rest as well */
                     region[n_region++] = (region_t){ e->base, e->base, e->len };
                 }
         }
@@ -699,19 +642,18 @@ void start(uint64_t info){
     }
 
     int *char2bitmap(int target_w, int target_h, const char *svg, const int *color, bool do_fill){
-        /* ---------- microscopic helpers ---------------- */
         bool is_space(char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; }
         bool is_digit(char c){ return c>='0'&&c<='9'; }
         bool is_alpha(char c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z'); }
         char to_upper(char c){ return (c>='a'&&c<='z')?(char)(c-'a'+'A'):c; }
 
-        const char* find_char(const char*s,char ch)
-        { while(*s&&*s!=ch)++s; return *s? s: 0; }
+        const char* find_char(const char* s, char ch){ 
+            while(*s&&*s!=ch) ++s; return *s ? s : 0; 
+        }
 
-        const char* find_token(const char*s,const char*tok,const char*lim)
-        {
+        const char* find_token(const char* s, const char* tok, const char* lim){
             size_t L=0; while(tok[L]) ++L;
-            while(*s && (!lim||s<lim)){
+            while(*s && (!lim || s<lim)){
                 size_t i=0; while(i<L && s[i]==tok[i]) ++i;
                 if(i==L) return s;
                 ++s;
@@ -726,51 +668,46 @@ void start(uint64_t info){
             *ps=p; return sign*val;
         }
 
-        void mem_copy(char *d,const char *s,size_t n)
-        { for(size_t i=0;i<n;++i) d[i]=s[i]; }
+        typedef struct{ 
+            float x0,y0,x1,y1; 
+        } Edge;
+        typedef struct Path{
+            Edge*e; 
+            int ec,cap; 
+            int r,g,b; 
+            struct Path*next; 
+        } Path;
 
-        /* ---------- geometry containers ---------------- */
-        typedef struct{ float x0,y0,x1,y1; } Edge;
-        typedef struct Path{ Edge*e;int ec,cap;int r,g,b;struct Path*next; } Path;
-
-        void edge_add(Path*p,float x0,float y0,float x1,float y1){
-            if(p->ec==p->cap){
-                p->cap = p->cap? p->cap*2 : 16;
-                p->e   = (Edge*)realloc(p->e,(size_t)p->cap*sizeof* p->e);
+        void edge_add(Path*p, float x0, float y0, float x1, float y1){
+            if(p->ec == p->cap){
+                p->cap = p->cap ? p->cap*2 : 16;
+                p->e = (Edge*)realloc(p->e,(size_t)p->cap*sizeof *p->e);
             }
             p->e[p->ec++] = (Edge){x0,y0,x1,y1};
         }
 
-        /* skip commas and whitespace – SVG treats them the same           */
-        void skip_ws(const char **ps)
-        { while(**ps && (is_space(**ps)||**ps==',')) ++(*ps); }
+        void skip_ws(const char **ps){
+            while(**ps && (is_space(**ps)||**ps==',')) ++(*ps); 
+        }
 
-        /*  robust float scanner – stops on '+' / '-' that *don’t* belong
-            to an exponent, so “186.37-455.68” is split correctly          */
         float next_f(const char **ps){
             char buf[64]; int n=0;
             const char *p=*ps;
-            /* optional sign */
             if(*p=='-'||*p=='+') buf[n++]=*p++;
             while(1){
                 char c=*p;
                 if(is_digit(c)||c=='.'){ buf[n++]=c; ++p; continue; }
                 if((c=='e'||c=='E') && (p[1]=='+'||p[1]=='-'||is_digit(p[1]))){
-                    buf[n++]=c; ++p;
-                    buf[n++]=*p;        /* copy the sign */
-                    ++p; continue;
+                    buf[n++]=c; ++p; buf[n++]=*p++; continue;
                 }
-                break;                 /* end of number */
+                break;
             }
-            buf[n]=0;
-            *ps=p;
+            buf[n]=0; *ps=p;
             return parse_float(buf);
         }
 
-        /* quadratic & cubic subdivision (straight-line approximation) */
         const float DT = 0.01f;
-
-        void quad(Path*p,float x0,float y0,float x1,float y1,float x2,float y2){
+        void quad(Path*p, float x0, float y0, float x1, float y1, float x2, float y2){
             float px=x0,py=y0;
             for(float t=DT;t<=1.0f+1e-4f;t+=DT){
                 float u=1.0f-t;
@@ -779,20 +716,17 @@ void start(uint64_t info){
                 edge_add(p,px,py,x,y); px=x; py=y;
             }
         }
-
-        void cubic(Path*p,float x0,float y0,float x1,float y1,
-                float x2,float y2,float x3,float y3){
+        void cubic(Path*p,float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3){
             float px=x0,py=y0;
             for(float t=DT;t<=1.0f+1e-4f;t+=DT){
                 float u=1.0f-t;
-                float x = u*u*u*x0 + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3;
-                float y = u*u*u*y0 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3;
+                float x=u*u*u*x0 + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3;
+                float y=u*u*u*y0 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3;
                 edge_add(p,px,py,x,y); px=x; py=y;
             }
         }
 
-        /*  even/odd winding test   */
-        bool inside(const Path *p,float px,float py){
+        bool inside(const Path *p, float px, float py){
             bool in=false;
             for(int i=0;i<p->ec;++i){
                 Edge e=p->e[i];
@@ -803,13 +737,10 @@ void start(uint64_t info){
             }
             return in;
         }
-
-        /*  stroke hit-test (≈ 1-pixel thick) */
-        bool on_edge(const Path *p,float px,float py){
+        bool on_edge(const Path *p, float px, float py){
             const float EPS=0.50f;
             for(int i=0;i<p->ec;++i){
                 Edge e=p->e[i];
-                /* quick reject */
                 if(px < (e.x0<e.x1?e.x0:e.x1)-EPS ||
                 px > (e.x0>e.x1?e.x0:e.x1)+EPS ||
                 py < (e.y0<e.y1?e.y0:e.y1)-EPS ||
@@ -825,107 +756,174 @@ void start(uint64_t info){
             return false;
         }
 
-        /* ---------------- optional header (ignored for geometry) -------- */
         const char *hash=find_char(svg,'#');
-        /* we still parse it, just don’t use it – the glyph bbox is deduced
-        from the actual path, which works with both positive and negative
-        coordinate systems.                                             */
+        bool has_metrics=false;
+        int hdr_adv=0,hdr_xMin=0,hdr_yMin=0,hdr_xMax=0,hdr_yMax=0;
+        if(hash){
+            const char *ptr=svg;
+            int tmp[5]={0}; int n=0;
+            while(n<5 && ptr<hash){
+                tmp[n++]=parse_int(&ptr);
+                if(ptr<hash && *ptr==',') ++ptr; else break;
+            }
+            if(n==5){
+                hdr_adv=tmp[0]; hdr_xMin=tmp[1]; hdr_yMin=tmp[2];
+                hdr_xMax=tmp[3]; hdr_yMax=tmp[4];
+                has_metrics=true;
+            }
+        }
 
-        /* -------------------- PATH PARSING ------------------------------ */
-        const char *p = hash? hash+1 : svg;
+        int cell_w = has_metrics ? target_w : target_w * 2;
+        int cell_h = target_h;
+
+        const char *p=hash?hash+1:svg;
         Path *paths=0,*tail=0;
-        float minx=1e30f,miny=1e30f,maxx=-1e30f,maxy=-1e30f;
+        float minx= 1e30f, miny= 1e30f, maxx=-1e30f, maxy=-1e30f;
 
         while(*p){
-            const char *br=find_char(p,'['); if(!br) break;
-            const char *brEnd=find_char(br,']');     if(!brEnd) break;
+            const char *br=find_char(p,'[');
+            if(!br) break;
+            const char *brEnd=find_char(br,']');
+            if(!brEnd) break;
 
-            /* extract raw path data */
             size_t pdLen=(size_t)(br-p);
             char *pd=(char*)malloc(pdLen+1);
-            mem_copy(pd,p,pdLen); pd[pdLen]=0;
+            memcpy(pd,p,pdLen); pd[pdLen]=0;
 
-            /* ------------- colour -------------------------------------- */
-            int cr=color[0], cg=color[1], cb=color[2];    /* default */
+            int cr=color[0],cg=color[1],cb=color[2];
             const char *rgb=find_token(br,"{rgb(",brEnd);
             if(rgb){
                 const char *q=rgb+5;
-                if(is_digit(*q)||*q=='-'||*q=='+'){  /* explicit rgb(r,g,b) */
+                if(is_digit(*q)||*q=='-'||*q=='+'){
                     cr=parse_int(&q); if(*q==',') ++q;
                     cg=parse_int(&q); if(*q==',') ++q;
                     cb=parse_int(&q);
                 }
             }
 
-            Path *pp=(Path*)malloc(sizeof*pp);
+            Path *pp=(Path*)malloc(sizeof *pp);
             pp->e=0; pp->ec=pp->cap=0;
             pp->r=cr; pp->g=cg; pp->b=cb; pp->next=0;
             if(!paths) paths=pp; else tail->next=pp;
             tail=pp;
 
-            /* -------------- SVG command interpreter -------------------- */
-            const char *sp=pd; float cx=0,cy=0,sx=0,sy=0; char prev=0;
+            const char *sp=pd;
+            float cx = 0;
+            float cy = 0;
+            float sx = 0;
+            float sy = 0;
+            float cpx = 0;
+            float cpy = 0;
+            float qpx = 0;
+            float qpy = 0;
+            char lastRaw = 0;
+            char lastUC = 0;
+
             while(*sp){
                 skip_ws(&sp);
-                char cmd;
-                if(is_alpha(*sp)) cmd=*sp++;
-                else              cmd=prev;
-                prev=cmd;
-                bool rel = (cmd>='a'&&cmd<='z');
-                cmd      = to_upper(cmd);
+                if(!*sp) break;
+
+                char raw = is_alpha(*sp)?*sp++:lastRaw;
+                bool rel = (raw>='a'&&raw<='z');
+                char cmd = to_upper(raw);
 
                 if(cmd=='M'){
-                    float x=next_f(&sp); skip_ws(&sp);
+                    float x = next_f(&sp); 
+                    skip_ws(&sp);
                     float y=next_f(&sp); if(rel){x+=cx; y+=cy;}
-                    cx=sx=x; cy=sy=y; skip_ws(&sp);
-                    while(*sp&&(*sp=='-'||*sp=='+'||is_digit(*sp))){
+                    cx=sx=x; cy=sy=y; cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                    skip_ws(&sp);
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
                         float lx=next_f(&sp); skip_ws(&sp);
                         float ly=next_f(&sp); if(rel){lx+=cx; ly+=cy;}
-                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly; skip_ws(&sp);
+                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly;
+                        cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                        skip_ws(&sp);
                     }
-                }else if(cmd=='L'){
-                    while(*sp&&(*sp=='-'||*sp=='+'||is_digit(*sp))){
+                }
+                else if(cmd=='L'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
                         float lx=next_f(&sp); skip_ws(&sp);
                         float ly=next_f(&sp); if(rel){lx+=cx; ly+=cy;}
-                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly; skip_ws(&sp);
+                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly;
+                        cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                        skip_ws(&sp);
                     }
-                }else if(cmd=='H'||cmd=='V'){
-                    while(*sp&&(*sp=='-'||*sp=='+'||is_digit(*sp))){
+                }
+                else if(cmd=='H'||cmd=='V'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
                         float v=next_f(&sp);
-                        float lx=cx, ly=cy;
-                        if(cmd=='H'){ lx = rel? cx+v : v; }
-                        else         { ly = rel? cy+v : v; }
-                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly; skip_ws(&sp);
+                        float lx=cx,ly=cy;
+                        if(cmd=='H'){lx=rel?cx+v:v;} else{ly=rel?cy+v:v;}
+                        edge_add(pp,cx,cy,lx,ly); cx=lx; cy=ly;
+                        cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                        skip_ws(&sp);
                     }
-                }else if(cmd=='Q'){
-                    while(*sp&&(*sp=='-'||*sp=='+'||is_digit(*sp))){
+                }
+                else if(cmd=='Q'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
                         float x1=next_f(&sp); skip_ws(&sp);
                         float y1=next_f(&sp); skip_ws(&sp);
                         float x =next_f(&sp); skip_ws(&sp);
                         float y =next_f(&sp);
-                        if(rel){ x1+=cx; y1+=cy; x+=cx; y+=cy; }
-                        quad(pp,cx,cy,x1,y1,x,y); cx=x; cy=y; skip_ws(&sp);
+                        if(rel){x1+=cx;y1+=cy;x+=cx;y+=cy;}
+                        quad(pp,cx,cy,x1,y1,x,y); cx=x; cy=y;
+                        qpx=x1; qpy=y1; cpx=cx; cpy=cy;
+                        skip_ws(&sp);
                     }
-                }else if(cmd=='C'){
-                    while(*sp&&(*sp=='-'||*sp=='+'||is_digit(*sp))){
+                }
+                else if(cmd=='T'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
+                        float x=next_f(&sp); skip_ws(&sp);
+                        float y=next_f(&sp);
+                        if(rel){x+=cx;y+=cy;}
+                        float x1=(lastUC=='Q'||lastUC=='T')?(2*cx-qpx):cx;
+                        float y1=(lastUC=='Q'||lastUC=='T')?(2*cy-qpy):cy;
+                        quad(pp,cx,cy,x1,y1,x,y); cx=x; cy=y;
+                        qpx=x1; qpy=y1; cpx=cx; cpy=cy;
+                        skip_ws(&sp);
+                    }
+                }
+                else if(cmd=='C'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
                         float x1=next_f(&sp); skip_ws(&sp);
                         float y1=next_f(&sp); skip_ws(&sp);
                         float x2=next_f(&sp); skip_ws(&sp);
                         float y2=next_f(&sp); skip_ws(&sp);
                         float x =next_f(&sp); skip_ws(&sp);
                         float y =next_f(&sp);
-                        if(rel){ x1+=cx;y1+=cy;x2+=cx;y2+=cy;x+=cx;y+=cy; }
-                        cubic(pp,cx,cy,x1,y1,x2,y2,x,y); cx=x; cy=y; skip_ws(&sp);
+                        if(rel){x1+=cx;y1+=cy;x2+=cx;y2+=cy;x+=cx;y+=cy;}
+                        cubic(pp,cx,cy,x1,y1,x2,y2,x,y); cx=x; cy=y;
+                        cpx=x2; cpy=y2; qpx=cx; qpy=cy;
+                        skip_ws(&sp);
                     }
-                }else if(cmd=='Z'){
-                    edge_add(pp,cx,cy,sx,sy); cx=sx; cy=sy;
-                }else{
-                    while(*sp && !is_alpha(*sp)) ++sp;  /* skip junk */
                 }
+                else if(cmd=='S'){
+                    while(*sp && (*sp=='-'||*sp=='+'||is_digit(*sp))){
+                        float x2=next_f(&sp); skip_ws(&sp);
+                        float y2=next_f(&sp); skip_ws(&sp);
+                        float x =next_f(&sp); skip_ws(&sp);
+                        float y =next_f(&sp);
+                        if(rel){x2+=cx;y2+=cy;x+=cx;y+=cy;}
+                        float x1=(lastUC=='C'||lastUC=='S')?(2*cx-cpx):cx;
+                        float y1=(lastUC=='C'||lastUC=='S')?(2*cy-cpy):cy;
+                        cubic(pp,cx,cy,x1,y1,x2,y2,x,y); cx=x; cy=y;
+                        cpx=x2; cpy=y2; qpx=cx; qpy=cy;
+                        skip_ws(&sp);
+                    }
+                }
+                else if(cmd=='Z'){
+                    edge_add(pp,cx,cy,sx,sy); cx=sx; cy=sy;
+                    cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                }
+                else{
+                    while(*sp && !is_alpha(*sp)) ++sp;
+                    cpx=cx; cpy=cy; qpx=cx; qpy=cy;
+                }
+                lastRaw=raw; lastUC=cmd;
             }
             free(pd);
 
-            /* ------------- expand overall bounding box ----------------- */
             for(int i=0;i<pp->ec;++i){
                 Edge e=pp->e[i];
                 if(e.x0<minx) minx=e.x0; if(e.x1<minx) minx=e.x1;
@@ -933,51 +931,65 @@ void start(uint64_t info){
                 if(e.x0>maxx) maxx=e.x0; if(e.x1>maxx) maxx=e.x1;
                 if(e.y0>maxy) maxy=e.y0; if(e.y1>maxy) maxy=e.y1;
             }
-
-            p = brEnd+1;   /* continue with next path */
+            p=brEnd+1;
         }
 
-        /* -------------- bad input guard ------------------------------ */
-        if(minx>=maxx || miny>=maxy || target_w<=0 || target_h<=0){
-            int *z=(int*)malloc(2*sizeof*z); z[0]=z[1]=0; return z;
+        if(minx>=maxx || miny>=maxy || cell_w<=0 || cell_h<=0){
+            int *z=(int*)malloc(3*sizeof *z);
+            z[0]=z[1]=0; z[2]=-2; return z;
         }
 
-        /* -------------- transform: world → device -------------------- */
-        float gw = maxx-minx, gh = maxy-miny;
-        float sx = (float)target_w  / gw;
-        float sy = (float)target_h / gh;
-        float scale = sx<sy ? sx : sy;
-        float dx = ((float)target_w  - gw*scale)*0.5f;
-        float dy = ((float)target_h - gh*scale)*0.5f;
+        float gw=maxx-minx, gh=maxy-miny;
+        float scale, dx, dy;
 
-        /* -------------- allocate bitmap [w,h,pixels…] ---------------- */
-        size_t pixN = (size_t)target_w * (size_t)target_h * 3u;
-        int *bmp = (int*)malloc((2+pixN)*sizeof* bmp);
-        bmp[0]=target_w; bmp[1]=target_h;
+        if(has_metrics){
+            float sy=(float)cell_h / gh;
+            float sx=((float)cell_w - 1.0f) / maxx;
+            scale = sy < sx ? sy : sx;
+
+            dx = minx * scale;
+            dy = (float)cell_h + miny*scale;
+        }
+        else{
+            float sx=(float)cell_w / gw;
+            float sy=(float)cell_h / gh;
+            float s0 = sx<sy ? sx : sy;
+            float enlarge = s0 * 1.3f;
+            if(enlarge*gw > (float)cell_w || enlarge*gh > (float)cell_h){
+                enlarge = ((float)cell_w/gw < (float)cell_h/gh)
+                        ? (float)cell_w/gw : (float)cell_h/gh;
+            }
+            scale = enlarge;
+
+            dx = ((float)cell_w - gw*scale)*0.5f;
+            dy = ((float)cell_h - gh*scale)*0.5f;
+        }
+
+        size_t pixN=(size_t)cell_w*(size_t)cell_h*3u;
+        int *bmp=(int*)malloc((3+pixN)*sizeof *bmp);
+        bmp[0]=cell_w; bmp[1]=cell_h;
+        bmp[2+pixN] = has_metrics ? -2 : -3;
         for(size_t i=0;i<pixN;++i) bmp[2+i]=-1;
 
-        /* -------------- raster loop --------------------------------- */
         for(Path *pp=paths; pp; pp=pp->next){
-            for(int iy=0; iy<target_h; ++iy){
-                float py = (float)iy + 0.5f;
-                float wy = miny + ((py - dy) / scale);
-                for(int ix=0; ix<target_w; ++ix){
-                    float px = (float)ix + 0.5f;
-                    float wx = minx + ((px - dx) / scale);
-
+            for(int iy=0; iy<cell_h; ++iy){
+                float py=(float)iy+0.5f;
+                float wy=miny + ((py-dy)/scale);
+                for(int ix=0; ix<cell_w; ++ix){
+                    float px=(float)ix+0.5f;
+                    float wx=minx + ((px-dx)/scale);
                     bool hit = do_fill ? inside(pp,wx,wy)
                                     : on_edge(pp,wx,wy);
                     if(hit){
-                        size_t idx = 2+3*((size_t)iy*target_w + ix);
-                        bmp[idx  ] = pp->r;
-                        bmp[idx+1] = pp->g;
-                        bmp[idx+2] = pp->b;
+                        size_t idx=2+3*((size_t)iy*cell_w+ix);
+                        bmp[idx  ]=pp->r;
+                        bmp[idx+1]=pp->g;
+                        bmp[idx+2]=pp->b;
                     }
                 }
             }
         }
 
-        /* -------------- clean-up ------------------------------------ */
         while(paths){
             Path *n=paths->next;
             free(paths->e);
@@ -986,6 +998,7 @@ void start(uint64_t info){
         }
         return bmp;
     }
+
 
     int font_chars_length = 0;
     for (int index = 0; font_chars[index][0] != NULL; index++) {
@@ -1091,7 +1104,7 @@ void start(uint64_t info){
                                     PANIC();
                                     //bruh
                                     free(bmap);
-                                    bmap = char2bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), font_chars[char_index][1], (int[]){255, 255, 255}, true);
+                                    bmap = char2bitmap((int)(16 * size), (int)(24 * size), font_chars[char_index][1], (int[]){255, 255, 255}, true);
                                     if (!bmap){
                                         return NULL;
                                     }
@@ -1110,7 +1123,7 @@ void start(uint64_t info){
                     }
                     if (!found){
                         free(bmap);
-                        bmap = char2bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), font_chars[char_index][1], (int[]){255, 255, 255}, true);
+                        bmap = char2bitmap((int)(16 * size), (int)(24 * size), font_chars[char_index][1], (int[]){255, 255, 255}, true);
                         if (!bmap){
                             return NULL;
                         }
@@ -1118,7 +1131,7 @@ void start(uint64_t info){
                 }
                 else{
                     free(bmap);
-                    bmap = char2bitmap((int)(16 * size + 0.5f), (int)(24 * size + 0.5f), font_chars[char_index][1], (int[]){255, 255, 255}, true);
+                    bmap = char2bitmap((int)(16 * size), (int)(24 * size), font_chars[char_index][1], (int[]){255, 255, 255}, true);
                     if (!bmap){
                         return NULL;
                     }
@@ -1237,28 +1250,20 @@ void start(uint64_t info){
             screen_[2 + ((py * screen_[0] + px) * 3) + 2] = b;
         }
 
-        if (bmap[0] < 10 || bmap[1] < 10){
-            PANIC(); //th bro
-        }
         if (bmap[0] > screen_w || bmap[1] > screen_h){
             PANIC(); //huh
         }
 
-        int zeroes = 0;
-        for (int index = 2; index < bmap[0] * bmap[1]; index++){
-            if (bmap[index] < 0 || bmap[index] > 255){
-                PANIC(); //FUCK
-            }
-            if (bmap[index] == 0){
-                zeroes++;
-            }
+        //yea check if its an emoji
+        if (bmap[bmap[0] * bmap[1] * 3 + 2] == -3){
+            //Alr then we pass on the signal so scrollback can catch it because it's twice as 
+            //large so we count it like its two chars
+            screen_[screen_w * screen_h * 3 + 2 + 1] = -3;
         }
-        if (zeroes == bmap[0] * bmap[1]){
-            PANIC(); //FUCK AGAIN
-        }
+
         free(bmap);
         return screen_;
-    }
+    } 
 
     //Frame render function, this makes sure that the things we wanna draw are 
     //already rendered before we begin rendering them which prevents flicker.
@@ -1299,7 +1304,7 @@ void start(uint64_t info){
     }
 
     //Init screen
-    int *screen = malloc(sizeof(int) * (2 + screen_h * screen_w * 3));
+    int *screen = malloc(sizeof(int) * (2 + screen_h * screen_w * 3) + sizeof(int));
 
     screen[0] = screen_w;
     screen[1] = screen_h;
@@ -1307,6 +1312,8 @@ void start(uint64_t info){
     for (int index = 2; index < 2 + screen[0] * screen[1] * 3; index++){
         screen[index] = 0;
     }
+
+    screen[screen_h * screen_w * 3 + 2 + 1] = -4;
     
     //Cool test
     //Oh and so basically scrollback is ** now because its an array of strings because
@@ -1320,14 +1327,11 @@ void start(uint64_t info){
         int max_rows = screen_h / 24;
         if (max_rows == 0) max_rows = 1;
 
-        // First: figure out how many rows the current scrollback would occupy
         int rows = 0;
         int col  = 0;
         for (int i = 0; i < scrollback_size && scrollback[i]; i++) {
-            /* predict where THIS glyph would land */
             int x_char_next = (int)(screen_w / 50 + ((col + 1) * 16));
             if (x_char_next > screen_w) {
-                /* wrap before consuming the glyph */
                 col = 1;
                 rows++;
             }
@@ -1335,22 +1339,21 @@ void start(uint64_t info){
                 col++;
             }
         }
-        if (col != 0) rows++; // count last partial row
+        if (col != 0) rows++;
 
-        /* Second pass – skip the rows that won't be visible */
         int overflow = rows - max_rows;
         if (overflow > 0) {
             int skipped_rows = 0;
-            int i   = 0;   /* index into scrollback[] */
-            int col = 0;   /* column on the current row */
+            int i = 0;
+            int col = 0;
 
             while (i < scrollback_size && scrollback[i] && skipped_rows < overflow) {
                 int x_next = (int)(screen_w / 50 + ((col + 1) * 16));
                 if (x_next > screen_w) {
-                    col = 1;          /* ←-- keep the glyph we just wrapped to   */
-                    skipped_rows++;   /*      and count the finished row        */
+                    col = 1;
+                    skipped_rows++;
                 } else {
-                    col++;            /* still on the same line                 */
+                    col++;
                 }
                 i++;
             }
@@ -1358,8 +1361,7 @@ void start(uint64_t info){
         } else {
             scrollback_cursor = 0;
         }
-
-        // Third: render from scrollback_cursor onward
+        
         int column = 0;
         int row = 0;
         for (int i = scrollback_cursor; i < scrollback_size && scrollback[i]; i++) {
@@ -1373,11 +1375,19 @@ void start(uint64_t info){
                 y_char = (int)(24 * row);
             }
 
-            screen = draw_chr(scrollback[i], x_char, y_char, 1, (int[]){0, 0, 0}, screen); //Default scale + black background
-            if (!screen){
+            screen[screen_w * screen_h * 3 + 2 + 1] = -4;
+
+            screen = draw_chr(scrollback[i], x_char, y_char, 1, (int[]){0, 0, 0}, screen); // Default scale + black background
+            if (!screen) {
                 PANIC();
             }
-            column++;
+
+            if (screen[screen_w * screen_h * 3 + 2 + 1] == -3) {
+                screen[screen_w * screen_h * 3 + 2 + 1] = -4;
+                column += 2;
+            } else {
+                column++;
+            }
         }
     }
 
@@ -1433,9 +1443,6 @@ void start(uint64_t info){
     // draw_rect(0, 0, 300, 300, rgb(0, 255, 0));
     // draw_rect(0, 0, 100, 100, rgb(0, 0, 255));
 
-    while (true){
-        print("Welcome to fishOS!");
-    }
-
+    print("Welcome to fishOS. Here's a fish btw: 🐟 nice also here's another emoji: 🥀");
     for (;;) __asm__("cli; hlt"); 
 }
