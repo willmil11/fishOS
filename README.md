@@ -1,4 +1,4 @@
-# 🐟 FishOS 0.0.11
+# 🐟 FishOS 0.0.12
 
 # What's this?
 It's an os built from scratch, the only thing not built by me here is grub that i'm only using to boot.
@@ -47,12 +47,15 @@ Alpine (```apk```)
 sudo apk add fish
 ```
 
-# Known bugs
-- Chars are not the same size
-- Chars are too fat
+# Known bugs (will be fixed ASAP)
+- Printing multiple rows of text breaks stuff
+- Some emojis cause kernel panic
+- Printing too much text in a single print calls breaks stuff
+- Memory allocator doesn't handle well allocs >256mb
 
 # Version history
 Notes: It works that's it. For now it boots and does something interesting, it's only gonna become an actual useful os over time.
+- 0.0.12 — Readme fix.
 - 0.0.11 — Emoji rendering is fixed, font rendering is fixed (FINALLLLYYYYY), just don't breathe near it wrong or it WILL kernel panic.
 - 0.0.10 — Readme fix. 
 - 0.0.9 — Major upgrade to print system, now supports all utf8 + emojis, emojis rendering is very temporarily broken because of a missing svg command, font is more accurate now, still size and position problems but way better than before. Also fixed a major bug in the slab part of the memory allocator :) For now at boot just spams "Welcome to fishOS!".
